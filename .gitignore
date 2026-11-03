@@ -1,0 +1,11 @@
+.env
+.env.*
+.clasprc.json
+.clasp.json
+*.pem
+*.key
+*.log
+__pycache__/
+.venv/
+node_modules/
+credentials/
