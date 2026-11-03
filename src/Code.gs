@@ -108,6 +108,16 @@ function wbSetupForecastSheet_(book) {
   const n = out.getMaxRows() - 1;
   out.getRange(2, 1, n, 1).setDataValidation(SpreadsheetApp.newDataValidation()
     .requireValueInRange(src.getRange(2, 3, end - 1, 1), true).setAllowInvalid(false).build());
+  const periodRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Вчера', 'Последние 7 дней', 'Последние 30 дней',
+      'Последние 90 дней', 'Последние 365 дней'], true)
+    .setAllowInvalid(false).build();
+  if (!out.getRange('W1').getValue()) out.getRange('W1').setValue('Период обновления');
+  if (!out.getRange('W2').getValue()) out.getRange('W2').setValue('Вчера');
+  out.getRange('W2').setDataValidation(periodRule);
+  out.getRange('W1').setBackground('#294954').setFontColor('#f4efdf').setFontWeight('bold');
+  out.getRange('W2').setBackground('#d3e0e1').setFontColor('#243a40');
+  out.setColumnWidth(23, 190);
   // Заголовок и выпадающий список без заполнения рядов данными.
   out.getRange(2, 4, n, 1).setNote('Введите показы за период отчёта WB; CTR будет рассчитан, если WB вернёт показы.');
   out.getRange(2, 13, n, 1).setNote('Себестоимость одной выкупленной единицы. Можно заполнить позже.');
@@ -138,14 +148,30 @@ function wbWeek() { wbSetDays_(7); }
 function wbMonth() { wbSetDays_(30); }
 
 function wbSetDays_(days) {
-  wbRun_(days);
   PropertiesService.getScriptProperties().setProperty('WB_REPORT_DAYS', String(days));
+  wbSetForecastPeriod_(days);
+  wbRun_(days);
 }
 
 function wbUpdateAll() {
-  const days = Number(PropertiesService.getScriptProperties()
+  const sheet = SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
+  const selected = sheet ? String(sheet.getRange('W2').getDisplayValue()).trim() : '';
+  const fromSheet = {
+    'Вчера': 1, 'Последние 7 дней': 7, 'Последние 30 дней': 30,
+    'Последние 90 дней': 90, 'Последние 365 дней': 365
+  }[selected];
+  const days = fromSheet || Number(PropertiesService.getScriptProperties()
     .getProperty('WB_REPORT_DAYS') || 1);
+  PropertiesService.getScriptProperties().setProperty('WB_REPORT_DAYS', String(days));
   return wbRun_(days);
+}
+
+function wbSetForecastPeriod_(days) {
+  const sheet = SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
+  if (!sheet) return;
+  const labels = {1: 'Вчера', 7: 'Последние 7 дней', 30: 'Последние 30 дней',
+    90: 'Последние 90 дней', 365: 'Последние 365 дней'};
+  if (labels[days]) sheet.getRange('W2').setValue(labels[days]);
 }
 
 function wbRun_(days) {
@@ -155,8 +181,8 @@ function wbRun_(days) {
   }
   const props = PropertiesService.getScriptProperties();
   try {
-    if ([1, 7, 30].indexOf(days) === -1) {
-      throw new Error('WB_REPORT_DAYS должен быть равен 1, 7 или 30.');
+    if ([1, 7, 30, 90, 365].indexOf(days) === -1) {
+      throw new Error('Выберите период 1, 7, 30, 90 или 365 дней.');
     }
     const token = (props.getProperty('WB_API_TOKEN') || '').trim();
     if (!token) throw new Error('Добавьте WB_API_TOKEN в свойства скрипта.');
