@@ -52,6 +52,7 @@ function onOpen() {
 
 function wbInstall() {
   PropertiesService.getScriptProperties().setProperty('WB_SPREADSHEET_ID', WB.bookId);
+  wbSetupForecastSheet_(SpreadsheetApp.openById(WB.bookId));
   // Сначала успешная загрузка; затем регистрация ежедневного запуска.
   const result = wbUpdateAll();
   const pendingRetry = PropertiesService.getScriptProperties().getProperty('WB_RETRY_TRIGGER_ID');
@@ -63,6 +64,71 @@ function wbInstall() {
   wbToast_(result && result.deferred
     ? 'Ежедневное обновление включено. Первая загрузка отложена из-за лимита WB; повтор запланирован.'
     : 'Готово: обновление ежедневно между 04:00 и 05:00 МСК.');
+}
+
+function wbSetupForecastSheet_(book) {
+  const out = book.getSheetByName('Прогноз по конверсиям');
+  const src = book.getSheetByName(WB.sheet);
+  if (!out || !src) throw new Error('Проверьте наличие вкладок «Прогноз по конверсиям» и «' + WB.sheet + '».');
+  const h = ['Артикул WB','Товар','Тип товара','Показы (ввод)','CTR, %','Переходы',
+    'Корзины','Заказы','Выкупы','Переход → корзина, %','Корзина → заказ, %',
+    'Заказ → выкуп, %','Себестоимость за единицу, ₽ (ввод)',
+    'Реклама за период, ₽ (ввод)','Выручка выкупов, ₽',
+    'Прибыль после себестоимости и рекламы, ₽','Прибыль на выкуп, ₽',
+    'Переход → заказ, %','Заказы / 10 тыс. показов','Выкупы / 10 тыс. показов'];
+  const nr = Math.max(out.getLastRow(), 1), nc = Math.max(out.getLastColumn(), h.length);
+  const old = out.getRange(1, 1, nr, nc).getValues();
+  if (!h.every((v, i) => old[0][i] === v) && old.some(r => r.some(v => v !== ''))) {
+    throw new Error('На вкладке «Прогноз по конверсиям» уже есть данные; они не изменены.');
+  }
+  if (h.every((v, i) => old[0][i] === v)) return;
+  const end = src.getLastRow();
+  if (end < 2) throw new Error('Сначала заполните артикулы на вкладке «' + WB.sheet + '».');
+  if (out.getMaxColumns() < h.length) out.insertColumnsAfter(out.getMaxColumns(), h.length - out.getMaxColumns());
+  out.getRange(1, 1, 1, h.length).setValues([h]);
+  out.setFrozenRows(1);
+  out.getRange(1, 1, 1, h.length).setFontWeight('bold').setWrap(true);
+  const n = out.getMaxRows() - 1;
+  out.getRange(2, 1, n, 1).setDataValidation(SpreadsheetApp.newDataValidation()
+    .requireValueInRange(src.getRange(2, 3, end - 1, 1), true).setAllowInvalid(false).build());
+  const q = "'" + WB.sheet + "'!";
+  const productFormulas = [], funnelFormulas = [], profitFormulas = [], zeroAds = [];
+  for (let r = 2; r <= n + 1; r++) {
+    const match = `MATCH($A${r},${q}$C:$C,0)`;
+    productFormulas.push([
+      `=IF(A${r}="","",IFERROR(INDEX(${q}$B:$B,${match}),""))`,
+      `=IF(A${r}="","",IFERROR(INDEX(${q}$A:$A,${match}),""))`
+    ]);
+    funnelFormulas.push([
+      `=IFERROR(F${r}/D${r},"")`,
+      `=IF(A${r}="","",IFERROR(INDEX(${q}$AA:$AA,${match}),""))`,
+      `=IF(A${r}="","",IFERROR(INDEX(${q}$AB:$AB,${match}),""))`,
+      `=IF(A${r}="","",IFERROR(INDEX(${q}$AC:$AC,${match}),""))`,
+      `=IF(A${r}="","",IFERROR(INDEX(${q}$AD:$AD,${match}),""))`,
+      `=IFERROR(G${r}/F${r},"")`,`=IFERROR(H${r}/G${r},"")`,`=IFERROR(I${r}/H${r},"")`
+    ]);
+    zeroAds.push([0]);
+    profitFormulas.push([
+      `=IF(A${r}="","",IFERROR(INDEX(${q}$AE:$AE,${match}),""))`,
+      `=IF(OR(A${r}="",M${r}=""),"",O${r}-I${r}*M${r}-N${r})`,
+      `=IF(OR(A${r}="",I${r}=0,M${r}=""),"",(O${r}-N${r})/I${r}-M${r})`,
+      `=IFERROR(H${r}/F${r},"")`,
+      `=IF(OR(D${r}="",D${r}=0),"",10000*H${r}/D${r})`,
+      `=IF(OR(D${r}="",D${r}=0),"",10000*I${r}/D${r})`
+    ]);
+  }
+  out.getRange(2, 2, n, 2).setFormulas(productFormulas);
+  out.getRange(2, 5, n, 8).setFormulas(funnelFormulas);
+  out.getRange(2, 14, n, 1).setValues(zeroAds);
+  out.getRange(2, 15, n, 6).setFormulas(profitFormulas);
+  out.getRange(2, 4, n, 1).setNote('Введите показы за период данных WB; CTR считается как переходы / показы.');
+  out.getRange(2, 13, n, 1).setNote('Себестоимость за одну выкупленную единицу. Можно заполнить позже.');
+  out.getRange(2, 14, n, 1).setNote('Рекламные расходы за тот же период. Начальное значение — 0 ₽.');
+  out.getRange(2, 5, n, 1).setNumberFormat('0.00%');
+  out.getRange(2, 10, n, 3).setNumberFormat('0.00%');
+  out.getRange(2, 18, n, 1).setNumberFormat('0.00%');
+  out.getRange(2, 13, n, 4).setNumberFormat('#,##0.00');
+  out.getRange(2, 16, n, 2).setNumberFormat('#,##0.00');
 }
 
 function wbDisable() {
