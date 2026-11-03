@@ -14,7 +14,7 @@ const WB = Object.freeze({
     if (!active) throw new Error('Запустите wbInstall из привязанного к таблице проекта Apps Script.');
     return active.getId();
   },
-  sheet: 'Таблица конверсий',
+  sheet: 'Рабочая табличка',
   timezone: 'Europe/Moscow',
   url: 'https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products',
   pageSize: 1000,
