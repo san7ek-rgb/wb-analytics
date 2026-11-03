@@ -191,6 +191,7 @@ function wbCheckForCodeChanges() {
   // неудачный запрос каждую минуту. При HTTP 429 сработает штатный отложенный повтор.
   props.setProperty('WB_ACTIVE_RELEASE_SHA', loaded);
   wbToast_('Новый код WB найден. Запускаю обновление данных.');
+  wbSetupForecastSheet_(SpreadsheetApp.openById(WB.bookId));
   return wbUpdateAll();
 }
 
