@@ -77,20 +77,38 @@ function wbSetupForecastSheet_(book) {
     'Период данных WB'];
   const nr = Math.max(out.getLastRow(), 1), nc = Math.max(out.getLastColumn(), h.length);
   const old = out.getRange(1, 1, nr, nc).getValues();
-  if (!h.every((v, i) => old[0][i] === v) && old.some(r => r.some(v => v !== ''))) {
+  const alreadySetUp = h.every((v, i) => old[0][i] === v);
+  if (!alreadySetUp && old.some(r => r.some(v => v !== ''))) {
     throw new Error('На вкладке «Прогноз по конверсиям» уже есть данные; они не изменены.');
   }
-  if (h.every((v, i) => old[0][i] === v)) return;
   const end = src.getLastRow();
   if (end < 2) throw new Error('Сначала заполните артикулы на вкладке «' + WB.sheet + '».');
   if (out.getMaxColumns() < h.length) out.insertColumnsAfter(out.getMaxColumns(), h.length - out.getMaxColumns());
-  out.getRange(1, 1, 1, h.length).setValues([h]);
+  if (!alreadySetUp) out.getRange(1, 1, 1, h.length).setValues([h]);
   out.setFrozenRows(1);
-  out.getRange(1, 1, 1, h.length).setFontWeight('bold').setWrap(true);
+  out.getBandings().forEach(banding => banding.remove());
+  const table = out.getRange(1, 1, out.getMaxRows(), h.length);
+  const banding = table.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
+  banding.setHeaderRowColor('#294954');
+  banding.setFirstRowColor('#e2ebeb');
+  banding.setSecondRowColor('#d3e0e1');
+  out.setHiddenGridlines(true);
+  out.getRange(1, 1, 1, h.length).setFontColor('#f4efdf')
+    .setFontWeight('bold').setWrap(true).setVerticalAlignment('middle');
+  out.setRowHeight(1, 58);
+  out.setRowHeights(2, out.getMaxRows() - 1, 28);
+  out.setColumnWidth(1, 138);
+  out.setColumnWidths(2, 2, 188);
+  out.setColumnWidths(4, 9, 146);
+  out.setColumnWidth(13, 218);
+  out.setColumnWidth(14, 190);
+  out.setColumnWidths(15, 7, 190);
+  out.getRange(1, 1, out.getMaxRows(), h.length)
+    .setFontFamily('Arial').setVerticalAlignment('middle');
   const n = out.getMaxRows() - 1;
   out.getRange(2, 1, n, 1).setDataValidation(SpreadsheetApp.newDataValidation()
     .requireValueInRange(src.getRange(2, 3, end - 1, 1), true).setAllowInvalid(false).build());
-  // Только строка заголовков и список выбора. Ряды с данными остаются пустыми.
+  // Заголовок и выпадающий список без заполнения рядов данными.
   out.getRange(2, 4, n, 1).setNote('Введите показы за период отчёта WB; CTR будет рассчитан, если WB вернёт показы.');
   out.getRange(2, 13, n, 1).setNote('Себестоимость одной выкупленной единицы. Можно заполнить позже.');
   out.getRange(2, 14, n, 1).setNote('Расходы на рекламу за период. При пустом поле считаются равными 0 ₽.');
