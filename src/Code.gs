@@ -239,6 +239,7 @@ function wbRun_(days) {
     const sheet = wbSheet_();
     wbCheckLayout_(sheet);
     const period = wbPeriod_(days);
+    wbJamCtrQueue_(period);
     const state = { deadline: Date.now() + WB.budgetMs };
     const products = wbFetchProducts_(token, period, state);
     if (!products.length) {
@@ -775,6 +776,8 @@ function wbJamCtrNote_(message) {
 function wbJamCtrQueue_(period) {
   const props=PropertiesService.getScriptProperties();
   if (props.getProperty('WB_JAM_CTR_PERIOD') === wbPeriodLabel_(period)) return;
+  const pending=props.getProperty('WB_JAM_CTR_JOB');
+  if (pending && wbPeriodLabel_(JSON.parse(pending).period) === wbPeriodLabel_(period)) return;
   props.setProperty('WB_JAM_CTR_JOB',JSON.stringify({id:Utilities.getUuid(),period:period,stage:'create',attempts:0,next:0}));
   wbJamCtrNote_('CTR: запрошена автоматическая проверка расширенного CSV Джем за '+wbPeriodLabel_(period));
 }
