@@ -53,13 +53,16 @@ function onOpen() {
 function wbInstall() {
   PropertiesService.getScriptProperties().setProperty('WB_SPREADSHEET_ID', WB.bookId);
   // Сначала успешная загрузка; затем регистрация ежедневного запуска.
-  wbUpdateAll();
-  const old = wbOwnTriggers_();
+  const result = wbUpdateAll();
+  const pendingRetry = PropertiesService.getScriptProperties().getProperty('WB_RETRY_TRIGGER_ID');
+  const old = wbOwnTriggers_().filter(trigger => trigger.getUniqueId() !== pendingRetry);
   ScriptApp.newTrigger('wbUpdateAll').timeBased().everyDays(1)
     .atHour(4).inTimezone(WB.timezone).create();
   old.forEach(trigger => ScriptApp.deleteTrigger(trigger));
   onOpen();
-  wbToast_('Готово: обновление ежедневно между 04:00 и 05:00 МСК.');
+  wbToast_(result && result.deferred
+    ? 'Ежедневное обновление включено. Первая загрузка отложена из-за лимита WB; повтор запланирован.'
+    : 'Готово: обновление ежедневно между 04:00 и 05:00 МСК.');
 }
 
 function wbDisable() {
@@ -86,7 +89,7 @@ function wbSetDays_(days) {
 function wbUpdateAll() {
   const days = Number(PropertiesService.getScriptProperties()
     .getProperty('WB_REPORT_DAYS') || 1);
-  wbRun_(days);
+  return wbRun_(days);
 }
 
 function wbRun_(days) {
@@ -123,11 +126,17 @@ function wbRun_(days) {
     SpreadsheetApp.flush();
     const now = Utilities.formatDate(new Date(), WB.timezone, 'yyyy-MM-dd HH:mm:ss');
     props.setProperties({ WB_LAST_SUCCESS: now, WB_LAST_ERROR: '' });
+    wbClearRetry_(props);
     wbToast_('Обновлено товаров: ' + records.length + '. Период: ' + wbPeriodLabel_(period));
   } catch (error) {
     // Не записываем тела ответов WB, ключ или заголовки запросов в журнал.
     const message = error.message || 'Ошибка обновления WB.';
     props.setProperty('WB_LAST_ERROR', message.slice(0, 1000));
+    if (error.wbRetryAt) {
+      wbScheduleRetry_(props, error.wbRetryAt);
+      wbToast_(message + ' Автоматический повтор запланирован. Данные пока не обновлены.');
+      return { deferred: true };
+    }
     console.error(message);
     wbToast_(message);
     throw error;
@@ -265,15 +274,18 @@ function wbFetchProducts_(token, period, state) {
 function wbRequest_(token, payload, state) {
   const props = PropertiesService.getScriptProperties();
   for (let attempt = 0; attempt < 3; attempt++) {
-    const next = Number(props.getProperty('WB_NEXT_REQUEST_AT') || 0);
+    const next = wbNextRequestAt_(props);
     const wait = Math.max(0, next - Date.now());
-    if (Date.now() + wait + 15000 > state.deadline) {
-      throw new Error('Достигнут лимит времени запуска. Выберите меньший объём или повторите позже.');
+    if (wait > 30000 || (wait > 0 && Date.now() + wait + 15000 > state.deadline)) {
+      throw wbDeferredError_(next, props.getProperty('WB_LAST_HTTP_STATUS'));
+    }
+    if (Date.now() + 15000 > state.deadline) {
+      throw new Error('Не хватило времени на загрузку всех страниц WB. Запись в таблицу не выполнялась.');
     }
     if (wait) Utilities.sleep(wait);
     let response;
     // Сохраняем интервал и между ручным и ежедневным запуском.
-    props.setProperty('WB_NEXT_REQUEST_AT', String(Date.now() + WB.intervalMs));
+    props.setProperty('WB_NEXT_REQUEST_AT_V2', String(Date.now() + WB.intervalMs));
     try {
       response = UrlFetchApp.fetch(WB.url, {
         method: 'post', contentType: 'application/json',
@@ -285,6 +297,7 @@ function wbRequest_(token, payload, state) {
       throw new Error('Не удалось связаться с API WB. Данные не записаны.');
     }
     const status = response.getResponseCode();
+    props.setProperty('WB_LAST_HTTP_STATUS', String(status));
     if (status === 200) {
       try { return JSON.parse(response.getContentText()); }
       catch (_) { throw new Error('WB вернул некорректный JSON. Данные не записаны.'); }
@@ -292,20 +305,89 @@ function wbRequest_(token, payload, state) {
     if (status === 401) throw new Error('WB HTTP 401: проверьте токен и срок его действия.');
     if (status === 403) throw new Error('WB HTTP 403: проверьте права категории «Аналитика».');
     if (status === 429 || status >= 500) {
-      let seconds = 0;
-      const headers = response.getAllHeaders();
-      Object.keys(headers).forEach(key => {
-        if (/^(retry-after|x-ratelimit-retry|x-ratelimit-reset)$/i.test(key)) {
-          const value = Number(headers[key]);
-          if (Number.isFinite(value) && value > seconds) seconds = value;
-        }
-      });
-      props.setProperty('WB_NEXT_REQUEST_AT', String(Date.now() +
-        Math.max(WB.intervalMs * (attempt + 1), seconds * 1000)));
+      const delay = Math.max(WB.intervalMs * (attempt + 1),
+        wbRateLimitDelay_(response.getAllHeaders(), Date.now()));
+      const until = Date.now() + delay;
+      props.setProperty('WB_NEXT_REQUEST_AT_V2', String(until));
+      console.log('WB HTTP ' + status + ': ожидание ' + Math.ceil(delay / 1000) + ' сек.');
+      if (delay > 30000 || attempt === 2) throw wbDeferredError_(until, status);
       if (attempt < 2) continue;
     }
     throw new Error('API воронки WB: HTTP ' + status + '. Данные не записаны.');
   }
+}
+
+function wbNextRequestAt_(props) {
+  const saved = props.getProperty('WB_NEXT_REQUEST_AT_V2');
+  if (saved !== null) {
+    const value = Number(saved);
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+  }
+  // В старой версии абсолютный timestamp заголовка мог быть ошибочно
+  // прибавлен к текущему времени как длительность. Такое значение не переносим.
+  const legacy = Number(props.getProperty('WB_NEXT_REQUEST_AT') || 0);
+  const now = Date.now();
+  const valid = Number.isFinite(legacy) && legacy > now && legacy <= now + 86400000;
+  const next = valid ? legacy : 0;
+  if (legacy > now && !valid) {
+    console.log('Исправлено некорректное старое состояние ожидания; лимит будет уточнён по ответу WB.');
+  }
+  props.setProperty('WB_NEXT_REQUEST_AT_V2', String(next));
+  props.deleteProperty('WB_NEXT_REQUEST_AT');
+  return next;
+}
+
+function wbRateLimitDelay_(headers, now) {
+  let delay = 0;
+  Object.keys(headers).forEach(name => {
+    const key = name.toLowerCase();
+    if (['retry-after', 'x-ratelimit-retry', 'x-ratelimit-reset'].indexOf(key) === -1) return;
+    const raw = String(headers[name]).trim();
+    const value = Number(raw);
+    let milliseconds = 0;
+    if (raw !== '' && Number.isFinite(value) && value >= 0) {
+      if (key === 'retry-after') milliseconds = value * 1000; // HTTP: длительность в секундах.
+      else if (value >= 1e12) milliseconds = value - now; // Unix milliseconds.
+      else if (value >= 1e9) milliseconds = value * 1000 - now; // Unix seconds.
+      else milliseconds = value * 1000;
+    } else if (key === 'retry-after') {
+      const date = Date.parse(raw); // HTTP допускает дату вместо числа секунд.
+      if (Number.isFinite(date)) milliseconds = date - now;
+    }
+    if (Number.isFinite(milliseconds)) delay = Math.max(delay, milliseconds, 0);
+  });
+  return delay;
+}
+
+function wbDeferredError_(until, status) {
+  const date = Utilities.formatDate(new Date(until), WB.timezone, 'yyyy-MM-dd HH:mm:ss');
+  const http = Number(status);
+  const limited = http === 429 || http >= 500;
+  const error = new Error('Ожидание API WB' + (limited ? ' (HTTP ' + status + ')' : '') +
+    ' до ' + date + ' МСК.');
+  if (until <= Date.now() + 31 * 86400000) error.wbRetryAt = until;
+  return error;
+}
+
+function wbClearRetry_(props) {
+  const id = props.getProperty('WB_RETRY_TRIGGER_ID');
+  if (id) {
+    ScriptApp.getProjectTriggers().filter(trigger => trigger.getUniqueId() === id)
+      .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+    props.deleteProperty('WB_RETRY_TRIGGER_ID');
+  }
+}
+
+function wbScheduleRetry_(props, until) {
+  // Использует существующий обработчик загрузчика: его менять не требуется.
+  const previous = props.getProperty('WB_RETRY_TRIGGER_ID');
+  const trigger = ScriptApp.newTrigger('wbUpdateAll').timeBased()
+    .after(Math.max(60000, until - Date.now())).create();
+  if (previous) {
+    ScriptApp.getProjectTriggers().filter(item => item.getUniqueId() === previous)
+      .forEach(item => ScriptApp.deleteTrigger(item));
+  }
+  props.setProperty('WB_RETRY_TRIGGER_ID', trigger.getUniqueId());
 }
 
 function wbNumber_(value, field) {
