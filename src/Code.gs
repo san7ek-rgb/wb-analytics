@@ -70,81 +70,101 @@ function wbSetupForecastSheet_(book) {
   const src = book.getSheetByName(WB.sheet);
   if (!out || !src) throw new Error('Проверьте наличие вкладок «Прогноз по конверсиям» и «' + WB.sheet + '».');
   const h = ['Артикул WB','Товар','Тип товара','Показы (ввод)','CTR, %','Переходы',
-    'Корзины','Заказы','Выкупы','Переход → корзина, %','Корзина → заказ, %',
+    'Корзины','Переход → корзина, %','Заказы','Корзина → заказ, %','Выкупы',
     'Заказ → выкуп, %','Себестоимость за единицу, ₽ (ввод)',
     'Реклама за период, ₽ (ввод)','Выручка выкупов, ₽',
-    'Прибыль после себестоимости и рекламы, ₽','Прибыль на выкуп, ₽',
-    'Переход → заказ, %','Заказы / 10 тыс. показов','Выкупы / 10 тыс. показов',
-    'Период данных WB'];
-  const nr = Math.max(out.getLastRow(), 1), nc = Math.max(out.getLastColumn(), h.length);
-  const old = out.getRange(1, 1, nr, nc).getValues();
-  const alreadySetUp = h.every((v, i) => old[0][i] === v);
-  if (!alreadySetUp && old.some(r => r.some(v => v !== ''))) {
-    throw new Error('На вкладке «Прогноз по конверсиям» уже есть данные; они не изменены.');
+    'Прибыль после себестоимости и рекламы, ₽','Прибыль на выкуп, ₽','Маржинальность, %',
+    'Заказы / 10 тыс. показов','Выкупы / 10 тыс. показов','Период данных WB','Сравнить'];
+  const oldRows = Math.max(out.getLastRow(), 1), oldCols = Math.max(out.getLastColumn(), h.length);
+  const old = out.getRange(1, 1, oldRows, oldCols).getValues();
+  const oldHeaders = new Map((old[0] || []).map((v, i) => [String(v).trim(), i]));
+  const prior = new Map();
+  for (let r = 1; r < old.length; r++) {
+    const idCol = oldHeaders.has('Артикул WB') ? oldHeaders.get('Артикул WB') : 0;
+    const id = String(old[r][idCol] || '').trim();
+    if (/^\d+$/.test(id)) prior.set(id, old[r]);
   }
   const end = src.getLastRow();
   if (end < 2) throw new Error('Сначала заполните артикулы на вкладке «' + WB.sheet + '».');
-  if (out.getMaxColumns() < h.length) out.insertColumnsAfter(out.getMaxColumns(), h.length - out.getMaxColumns());
-  if (!alreadySetUp) out.getRange(1, 1, 1, h.length).setValues([h]);
+  const sourceRows = src.getRange(2, 1, end - 1, Math.max(3, src.getLastColumn())).getValues();
+  const products = new Map();
+  sourceRows.forEach(r => {
+    const id = String(r[2] || '').trim();
+    if (/^\d+$/.test(id) && !products.has(id)) products.set(id, [id, r[1] || '', r[0] || '']);
+  });
+  if (!products.size) throw new Error('На вкладке «' + WB.sheet + '» не найдены артикулы WB.');
+  if (out.getMaxColumns() < 26) out.insertColumnsAfter(out.getMaxColumns(), 26 - out.getMaxColumns());
+  const output = [h];
+  products.forEach((product, id) => {
+    const oldRow = prior.get(id);
+    const value = (heading, fallback) => {
+      const i = oldHeaders.get(heading);
+      return oldRow && i !== undefined && oldRow[i] !== '' ? oldRow[i] : fallback;
+    };
+    output.push([id, product[1], product[2], value('Показы (ввод)', ''), value('CTR, %', ''),
+      value('Переходы', ''), value('Корзины', ''), value('Переход → корзина, %', ''),
+      value('Заказы', ''), value('Корзина → заказ, %', ''), value('Выкупы', ''),
+      value('Заказ → выкуп, %', ''), value('Себестоимость за единицу, ₽ (ввод)', ''),
+      value('Реклама за период, ₽ (ввод)', 0), value('Выручка выкупов, ₽', ''),
+      value('Прибыль после себестоимости и рекламы, ₽', ''), value('Прибыль на выкуп, ₽', ''),
+      value('Маржинальность, %', ''), value('Заказы / 10 тыс. показов', ''),
+      value('Выкупы / 10 тыс. показов', ''), value('Период данных WB', ''), value('Сравнить', false)]);
+  });
+  const priorPeriod = out.getRange('W2').getValue();
+  out.getRange(1, 1, out.getMaxRows(), 22).clearContent();
+  out.getRange(1, 1, output.length, 22).setValues(output);
+  if (out.getFilter()) out.getFilter().remove();
+  out.getRange(1, 1, output.length, 22).createFilter();
+  out.getRange(2, 22, output.length - 1, 1).insertCheckboxes();
+  out.getRange(2, 22, output.length - 1, 1).setValues(output.slice(1).map(r => [r[21] === true]));
   out.setFrozenRows(1);
-  out.getBandings().forEach(banding => banding.remove());
-  const table = out.getRange(1, 1, out.getMaxRows(), h.length);
-  const banding = table.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
-  banding.setHeaderRowColor('#294954');
-  banding.setFirstRowColor('#e2ebeb');
-  banding.setSecondRowColor('#d3e0e1');
-  out.setHiddenGridlines(true);
-  out.getRange(1, 1, 1, h.length).setFontColor('#f4efdf')
-    .setFontWeight('bold').setWrap(true).setVerticalAlignment('middle');
-  out.setRowHeight(1, 58);
-  out.setRowHeights(2, out.getMaxRows() - 1, 28);
-  out.setColumnWidth(1, 138);
-  out.setColumnWidths(2, 2, 188);
-  out.setColumnWidths(4, 9, 146);
-  out.setColumnWidth(13, 218);
-  out.setColumnWidth(14, 190);
-  out.setColumnWidths(15, 7, 190);
-  out.getRange(1, 1, out.getMaxRows(), h.length)
-    .setFontFamily('Arial').setVerticalAlignment('middle');
-  const n = out.getMaxRows() - 1;
-  out.getRange(2, 1, n, 1).setDataValidation(SpreadsheetApp.newDataValidation()
-    .requireValueInRange(src.getRange(2, 3, end - 1, 1), true).setAllowInvalid(false).build());
-  const periodRule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(['Вчера', 'Последние 7 дней', 'Последние 30 дней',
-      'Последние 90 дней', 'Последние 365 дней'], true)
-    .setAllowInvalid(false).build();
-  if (!out.getRange('W1').getValue()) out.getRange('W1').setValue('Период обновления');
-  if (!out.getRange('W2').getValue()) out.getRange('W2').setValue('Вчера');
-  out.getRange('W2').setDataValidation(periodRule);
-  out.getRange('W1').setBackground('#294954').setFontColor('#f4efdf').setFontWeight('bold');
-  out.getRange('W2').setBackground('#d3e0e1').setFontColor('#243a40');
-  out.setColumnWidth(23, 190);
-  const costHeaders = out.getRange(1, 24, 1, 3).getValues()[0];
-  const expectedCostHeaders = ['WB ID из файла себестоимости', 'Себестоимость из файла, ₽', 'Последняя дата в файле'];
-  if (costHeaders.every(value => value === '')) {
-    out.getRange(1, 24, 1, 3).setValues([expectedCostHeaders]);
-  } else if (!expectedCostHeaders.every((value, index) => costHeaders[index] === value)) {
-    throw new Error('Вспомогательные столбцы себестоимости X:Z заняты другими данными.');
-  }
-  const costBand = out.getRange(1, 24, out.getMaxRows(), 3)
+  out.getBandings().forEach(b => b.remove());
+  const banding = out.getRange(1, 1, output.length, 22)
     .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
-  costBand.setHeaderRowColor('#294954');
-  costBand.setFirstRowColor('#e2ebeb');
-  costBand.setSecondRowColor('#d3e0e1');
-  out.getRange(1, 24, 1, 3).setFontColor('#f4efdf').setFontWeight('bold').setWrap(true);
-  out.getRange(1, 24, out.getMaxRows(), 3).setFontFamily('Arial');
-  out.setColumnWidths(24, 2, 205);
-  out.setColumnWidth(26, 150);
-  // Заголовок и выпадающий список без заполнения рядов данными.
-  out.getRange(2, 4, n, 1).setNote('Введите показы за период отчёта WB; CTR будет рассчитан, если WB вернёт показы.');
-  out.getRange(2, 13, n, 1).setNote('Себестоимость одной выкупленной единицы. Можно заполнить позже.');
-  out.getRange(2, 14, n, 1).setNote('Расходы на рекламу за период. При пустом поле считаются равными 0 ₽.');
-  out.getRange(2, 5, n, 1).setNumberFormat('0.00%');
-  out.getRange(2, 10, n, 3).setNumberFormat('0.00%');
-  out.getRange(2, 18, n, 1).setNumberFormat('0.00%');
-  out.getRange(2, 13, n, 4).setNumberFormat('#,##0.00');
-  out.getRange(2, 16, n, 2).setNumberFormat('#,##0.00');
-  out.getRange(2, 19, n, 2).setNumberFormat('#,##0.00');
+  banding.setHeaderRowColor('#243b53');
+  banding.setFirstRowColor('#e7eef5');
+  banding.setSecondRowColor('#dce8f2');
+  out.setHiddenGridlines(true);
+  out.getRange(1, 1, output.length, 22).setFontFamily('Arial').setVerticalAlignment('middle');
+  out.getRange(1, 1, 1, 22).setFontColor('#ffffff').setFontWeight('bold').setWrap(true);
+  out.setRowHeight(1, 58);
+  out.setRowHeights(2, Math.max(output.length - 1, 1), 28);
+  out.setColumnWidth(1, 138); out.setColumnWidth(2, 250); out.setColumnWidth(3, 155);
+  out.setColumnWidths(4, 9, 142); out.setColumnWidth(13, 218); out.setColumnWidth(14, 190);
+  out.setColumnWidths(15, 4, 190); out.setColumnWidths(19, 3, 170); out.setColumnWidth(22, 95);
+  const periodRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Вчера','Последние 7 дней','Последние 30 дней','Последние 90 дней','Последние 365 дней'], true)
+    .setAllowInvalid(false).build();
+  out.getRange('W1').setValue('Период обновления');
+  out.getRange('W2').setValue(priorPeriod || 'Вчера').setDataValidation(periodRule);
+  out.getRange('W1').setBackground('#243b53').setFontColor('#ffffff').setFontWeight('bold');
+  out.getRange('W2').setBackground('#dce8f2').setFontColor('#243b53');
+  out.setColumnWidth(23, 190);
+  const expected = ['WB ID из файла себестоимости','Себестоимость из файла, ₽','Последняя дата в файле'];
+  const costHeaders = out.getRange(1, 24, 1, 3).getValues()[0];
+  if (costHeaders.every(v => v === '')) out.getRange(1, 24, 1, 3).setValues([expected]);
+  else if (!expected.every((v, i) => costHeaders[i] === v)) throw new Error('X:Z заняты данными; справочник себестоимости не изменён.');
+  const costBand = out.getRange(1, 24, out.getMaxRows(), 3).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
+  costBand.setHeaderRowColor('#243b53'); costBand.setFirstRowColor('#e7eef5'); costBand.setSecondRowColor('#dce8f2');
+  out.getRange(1, 24, 1, 3).setFontColor('#ffffff').setFontWeight('bold').setWrap(true);
+  out.setColumnWidths(24, 2, 205); out.setColumnWidth(26, 150);
+  const n = output.length - 1;
+  if (n > 0) {
+    [[5],[8],[10],[12],[18]].forEach(x => out.getRange(2, x[0], n, 1).setNumberFormat('0.00%'));
+    [13,14,15,16,17].forEach(c => out.getRange(2,c,n,1).setNumberFormat('#,##0.00'));
+    [4,6,7,9,11,19,20].forEach(c => out.getRange(2,c,n,1).setNumberFormat('#,##0.##'));
+    const rules = [];
+    [15,17,18,19,20].forEach(c => {
+      const L = String.fromCharCode(64+c), rng = out.getRange(2,c,n,1), endRow=n+1;
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(`=AND(${L}2<>"",${L}2<=PERCENTILE($${L}$2:$${L}$${endRow},0.33))`).setBackground('#f4cccc').setRanges([rng]).build());
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(`=AND(${L}2<>"",${L}2>PERCENTILE($${L}$2:$${L}$${endRow},0.33),${L}2<PERCENTILE($${L}$2:$${L}$${endRow},0.67))`).setBackground('#fff2cc').setRanges([rng]).build());
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(`=AND(${L}2<>"",${L}2>=PERCENTILE($${L}$2:$${L}$${endRow},0.67))`).setBackground('#d9ead3').setRanges([rng]).build());
+    });
+    out.setConditionalFormatRules(rules);
+  }
+  out.getRange(2,4,Math.max(n,1),1).setNote('Показы выбранного периода. Заполнятся автоматически, если WB вернёт метрику показов.');
+  out.getRange(2,13,Math.max(n,1),1).setNote('Себестоимость одной выкупленной единицы. Ручное значение сохраняется.');
+  out.getRange(2,14,Math.max(n,1),1).setNote('Рекламные расходы за период; по умолчанию 0 ₽.');
   return out;
 }
 
@@ -229,7 +249,7 @@ function wbRun_(days) {
     // Только имена полей, без ключа, значений или персональных данных.
     const selectedFields = products[0].statistic.selected;
     console.log('WB поля воронки: ' + Object.keys(selectedFields).sort().join(', '));
-    console.log('WB поля конверсий: ' + Object.keys(selectedFields.conversions || {}).sort().join(', '));
+    console.log('WB поля CTR/показов: ' + wbMetricPaths_(products[0]).join(', '));
     const ids = new Set();
     records.forEach(record => {
       if (ids.has(record.id)) {
@@ -512,27 +532,59 @@ function wbNumber_(value, field) {
   return value;
 }
 
+function wbMetricPaths_(root) {
+  const found = [], stack = [{value: root, path: ''}], seen = new Set();
+  while (stack.length) {
+    const node=stack.pop();
+    if (!node.value || typeof node.value !== 'object' || seen.has(node.value)) continue;
+    seen.add(node.value);
+    Object.keys(node.value).forEach(key => {
+      const path=node.path ? node.path+'.'+key : key;
+      if (/(ctr|impression|show|view|click)/i.test(key)) found.push(path);
+      if (node.value[key] && typeof node.value[key] === 'object') stack.push({value:node.value[key],path:path});
+    });
+  }
+  return found.sort().slice(0,100);
+}
+
+function wbMetric_(root, aliases) {
+  const wanted = new Set(aliases.map(x => x.toLowerCase()));
+  const stack = [root];
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || typeof value !== 'object') continue;
+    Object.keys(value).forEach(key => {
+      if (wanted.has(key.toLowerCase()) && typeof value[key] === 'number' && Number.isFinite(value[key])) {
+        stack.push({__metricFound: value[key]});
+      } else if (value && typeof value[key] === 'object') stack.push(value[key]);
+    });
+    const found = stack.find(x => x && typeof x === 'object' && Object.prototype.hasOwnProperty.call(x, '__metricFound'));
+    if (found) return found.__metricFound;
+  }
+  return undefined;
+}
+
 function wbRecord_(item, period) {
   const product = item && item.product;
   const stats = item && item.statistic && item.statistic.selected;
   if (!product || !stats || !stats.period ||
       stats.period.start !== period.start || stats.period.end !== period.end ||
-      !Number.isSafeInteger(product.nmId) || product.nmId <= 0 ||
-      typeof product.title !== 'string') {
+      !Number.isSafeInteger(product.nmId) || product.nmId <= 0 || typeof product.title !== 'string') {
     throw new Error('Некорректная карточка или период в ответе WB. Данные не записаны.');
   }
-  const fields = ['openCount', 'cartCount', 'orderCount', 'buyoutCount', 'buyoutSum', 'avgPrice'];
+  const fields = ['openCount','cartCount','orderCount','buyoutCount','buyoutSum','avgPrice'];
   const numbers = fields.map(field => wbNumber_(stats[field], field));
   const conversions = stats.conversions || {};
-  const ratios = ['addToCartPercent', 'cartToOrderPercent', 'buyoutPercent']
+  const ratios = ['addToCartPercent','cartToOrderPercent','buyoutPercent']
     .map(field => wbNumber_(conversions[field], field) / 100);
+  const rawCtr = wbMetric_(item, ['ctr','ctrPercent','clickThroughRate','clickRate']);
+  const rawShows = wbMetric_(item, ['impressions','impressionCount','showCount','showsCount','showCardCount','viewCount','views']);
+  const ctr = rawCtr === undefined ? undefined : (rawCtr > 1 ? rawCtr / 100 : rawCtr);
   const stocks = product.stocks || {};
   return {
-    id: String(product.nmId), title: wbSafeText_(product.title),
-    type: wbProductType_(product.subjectName),
-    numbers: numbers, ratios: ratios,
-    stockWB: wbNumber_(stocks.wb, 'stocks.wb'),
-    stockMP: wbNumber_(stocks.mp, 'stocks.mp')
+    id: String(product.nmId), title: wbSafeText_(product.title), type: wbProductType_(product.subjectName),
+    numbers: numbers, ratios: ratios, ctr: ctr, impressions: rawShows,
+    stockWB: wbNumber_(stocks.wb, 'stocks.wb'), stockMP: wbNumber_(stocks.mp, 'stocks.mp')
   };
 }
 
@@ -621,71 +673,41 @@ function wbSyncForecast_(records, period) {
   const book = SpreadsheetApp.openById(WB.bookId);
   const sheet = book.getSheetByName('Прогноз по конверсиям');
   if (!sheet || sheet.getRange('A1').getValue() !== 'Артикул WB' || sheet.getLastRow() < 2) return;
-  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  const headers = sheet.getRange(1, 1, 1, 22).getValues()[0];
   const col = new Map(headers.map((value, index) => [String(value).trim(), index + 1]));
-  const idCol = col.get('Артикул WB');
-  if (!idCol) return;
-  const selected = sheet.getRange(2, idCol, sheet.getLastRow() - 1, 1).getDisplayValues();
+  const rows = sheet.getRange(2,1,sheet.getLastRow()-1,22).getValues();
   const byId = new Map(records.map(record => [record.id, record]));
-  const costRows = sheet.getRange(2, 24, Math.max(sheet.getLastRow() - 1, 1), 2).getValues();
+  const costRows = sheet.getRange(2,24,Math.max(sheet.getLastRow()-1,1),3).getValues();
   const costsById = new Map();
-  costRows.forEach(row => {
-    const id = String(row[0]).trim(), amount = row[1];
-    if (/^\d+$/.test(id) && typeof amount === 'number' && amount >= 0) costsById.set(id, amount);
-  });
-  const changes = new Map();
-  function put(row, heading, value) {
-    const column = col.get(heading);
-    if (!column || value === undefined) return;
-    if (!changes.has(column)) changes.set(column, []);
-    changes.get(column).push([row + 2, value]);
-  }
-  selected.forEach((cell, index) => {
-    const id = String(cell[0]).trim();
-    const record = byId.get(id);
+  costRows.forEach(r => { const id=String(r[0]).trim(); if (/^\d+$/.test(id) && typeof r[1]==='number') costsById.set(id,r[1]); });
+  const output = rows.map(row => row.slice());
+  let matches=0;
+  output.forEach((row,i) => {
+    const id=String(row[0]).trim(), record=byId.get(id);
     if (!record) return;
-    const n = record.numbers, ratios = record.ratios, row = index + 2;
-    const openingRate = n[0] ? n[2] / n[0] : '';
-    const facts = {
-      'Товар': record.title, 'Тип товара': record.type,
-      'Переходы': n[0], 'Корзины': n[1], 'Заказы': n[2], 'Выкупы': n[3],
-      'Переход → корзина, %': ratios[0], 'Корзина → заказ, %': ratios[1],
-      'Заказ → выкуп, %': ratios[2], 'Переход → заказ, %': openingRate,
-      'Выручка выкупов, ₽': n[4], 'Период данных WB': wbPeriodLabel_(period)
-    };
-    Object.keys(facts).forEach(key => put(index, key, facts[key]));
-    const spendCol = col.get('Реклама за период, ₽ (ввод)');
-    if (spendCol && sheet.getRange(row, spendCol).getValue() === '') put(index, 'Реклама за период, ₽ (ввод)', 0);
-    const costCol = col.get('Себестоимость за единицу, ₽ (ввод)');
-    let cost = costCol ? sheet.getRange(row, costCol).getValue() : '';
-    if ((cost === '' || cost === null) && costsById.has(id)) {
-      cost = costsById.get(id);
-      put(index, 'Себестоимость за единицу, ₽ (ввод)', cost);
-    }
-    const spend = spendCol ? Number(sheet.getRange(row, spendCol).getValue()) || 0 : 0;
-    if (cost !== '' && Number.isFinite(Number(cost))) {
-      put(index, 'Прибыль после себестоимости и рекламы, ₽', n[4] - n[3] * Number(cost) - spend);
-      if (n[3] > 0) put(index, 'Прибыль на выкуп, ₽', (n[4] - spend) / n[3] - Number(cost));
-    }
-    const formulas = [
-      `=IF(OR(D${row}="",D${row}=0),"",F${row}/D${row})`,
-      `=IF(OR(A${row}="",M${row}=""),"",O${row}-I${row}*M${row}-N${row})`,
-      `=IF(OR(A${row}="",I${row}=0,M${row}=""),"",(O${row}-N${row})/I${row}-M${row})`,
-      `=IFERROR(H${row}/F${row},"")`,
-      `=IF(OR(D${row}="",D${row}=0),"",10000*H${row}/D${row})`,
-      `=IF(OR(D${row}="",D${row}=0),"",10000*I${row}/D${row})`
-    ];
-    sheet.getRange(row, 5, 1, 1).setFormula(formulas[0]);
-    sheet.getRange(row, 15, 1, 6).setFormulas([[
-      `=${n[4]}`, formulas[1], formulas[2], formulas[3], formulas[4], formulas[5]
-    ]]);
+    matches++;
+    const n=record.numbers, ratios=record.ratios;
+    if (record.title) row[1]=record.title;
+    if (record.type) row[2]=record.type;
+    if (record.impressions !== undefined && record.impressions >= 0) row[3]=record.impressions;
+    if (record.ctr !== undefined) row[4]=record.ctr;
+    else if (Number(row[3])>0) row[4]=n[0]/Number(row[3]);
+    row[5]=n[0]; row[6]=n[1]; row[7]=ratios[0]; row[8]=n[2]; row[9]=ratios[1]; row[10]=n[3]; row[11]=ratios[2];
+    if ((row[12]==='' || row[12]===null) && costsById.has(id)) row[12]=costsById.get(id);
+    if (row[13]==='' || row[13]===null) row[13]=0;
+    row[14]=n[4];
+    const cost=Number(row[12]), ads=Number(row[13])||0;
+    if (row[12]!=='' && Number.isFinite(cost)) {
+      row[15]=n[4]-n[3]*cost-ads;
+      row[16]=n[3]>0?(n[4]-ads)/n[3]-cost:'';
+      row[17]=n[4]>0?row[15]/n[4]:'';
+    } else { row[15]=''; row[16]=''; row[17]=''; }
+    row[18]=Number(row[3])>0?10000*n[2]/Number(row[3]):'';
+    row[19]=Number(row[3])>0?10000*n[3]/Number(row[3]):'';
+    row[20]=wbPeriodLabel_(period);
   });
-  changes.forEach((cells, column) => cells.forEach(cell =>
-    sheet.getRange(cell[0], column).setValue(cell[1])));
-  const periodCol = col.get('Период данных WB');
-  if (periodCol) selected.forEach((cell, index) => {
-    if (byId.has(String(cell[0]).trim())) sheet.getRange(index + 2, periodCol).setValue(wbPeriodLabel_(period));
-  });
+  if (matches) sheet.getRange(2,1,output.length,22).setValues(output);
+  console.log('Обновлено строк прогноза: '+matches+' из '+output.length+'.');
 }
 
 function wbEmptyFormula_(sheet, row, column, formula) {
