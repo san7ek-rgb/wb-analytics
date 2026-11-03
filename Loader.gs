@@ -7,7 +7,7 @@
 const WB_LOADER = Object.freeze({
   base: 'https://raw.githubusercontent.com/san7ek-rgb/wb-analytics/main/',
   handlers: ['wbInstall', 'wbUpdateAll', 'wbYesterday', 'wbWeek', 'wbMonth',
-    'wbShowInStock', 'wbShowAllStock', 'wbDisable']
+    'wbShowInStock', 'wbShowAllStock', 'wbDisable', 'wbCheckForCodeChanges']
 });
 
 // Простой триггер не обращается к сети и не требует авторизации.
@@ -39,6 +39,7 @@ function wbWeek() { wbRunRemote_('wbWeek'); }
 function wbMonth() { wbRunRemote_('wbMonth'); }
 function wbShowInStock() { wbRunRemote_('wbShowInStock'); }
 function wbShowAllStock() { wbRunRemote_('wbShowAllStock'); }
+function wbCheckForCodeChanges() { wbRunRemote_('wbCheckForCodeChanges'); }
 
 // Отключение работает даже при недоступности GitHub.
 function wbDisable() {
@@ -84,8 +85,11 @@ function wbRunRemote_(handler) {
   if (digest !== release.sha256) {
     throw new Error('Контрольная сумма версии не совпадает. Код не запущен.');
   }
+  const properties = PropertiesService.getScriptProperties();
+  properties.setProperty('WB_LOADED_RELEASE_SHA', release.sha256);
   console.log('Версия WB: ' + release.sha256.slice(0, 12));
   // Ключ WB не передаётся в GitHub. Исполняется только проверенный выпуск
   // из фиксированного репозитория; entry point выбран из закрытого списка.
   eval(source + '\n' + handler + '();');
+  properties.setProperty('WB_ACTIVE_RELEASE_SHA', release.sha256);
 }

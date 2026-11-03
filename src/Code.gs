@@ -59,6 +59,7 @@ function wbInstall() {
   const old = wbOwnTriggers_().filter(trigger => trigger.getUniqueId() !== pendingRetry);
   ScriptApp.newTrigger('wbUpdateAll').timeBased().everyDays(1)
     .atHour(4).inTimezone(WB.timezone).create();
+  ScriptApp.newTrigger('wbCheckForCodeChanges').timeBased().everyMinutes(1).create();
   old.forEach(trigger => ScriptApp.deleteTrigger(trigger));
   onOpen();
   wbToast_('Пустая вкладка прогноза подготовлена. Данные загрузятся при следующем обновлении WB.');
@@ -138,7 +139,7 @@ function wbDisable() {
 
 function wbOwnTriggers_() {
   // Только обработчики этой интеграции и ранее выданного скрипта артикулов.
-  const names = ['wbUpdateAll', 'refreshArticles', 'setupArticleFilter'];
+  const names = ['wbUpdateAll', 'wbCheckForCodeChanges', 'refreshArticles', 'setupArticleFilter'];
   return ScriptApp.getProjectTriggers().filter(trigger =>
     names.indexOf(trigger.getHandlerFunction()) !== -1);
 }
@@ -164,6 +165,17 @@ function wbUpdateAll() {
     .getProperty('WB_REPORT_DAYS') || 1);
   PropertiesService.getScriptProperties().setProperty('WB_REPORT_DAYS', String(days));
   return wbRun_(days);
+}
+
+function wbCheckForCodeChanges() {
+  const props = PropertiesService.getScriptProperties();
+  const loaded = props.getProperty('WB_LOADED_RELEASE_SHA');
+  if (!loaded || loaded === props.getProperty('WB_ACTIVE_RELEASE_SHA')) return;
+  // Отмечаем выпуск перед обращением к WB, чтобы не запускать один и тот же
+  // неудачный запрос каждую минуту. При HTTP 429 сработает штатный отложенный повтор.
+  props.setProperty('WB_ACTIVE_RELEASE_SHA', loaded);
+  wbToast_('Новый код WB найден. Запускаю обновление данных.');
+  return wbUpdateAll();
 }
 
 function wbSetForecastPeriod_(days) {
