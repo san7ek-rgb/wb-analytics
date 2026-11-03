@@ -52,18 +52,16 @@ function onOpen() {
 
 function wbInstall() {
   PropertiesService.getScriptProperties().setProperty('WB_SPREADSHEET_ID', WB.bookId);
-  wbSetupForecastSheet_(SpreadsheetApp.openById(WB.bookId));
-  // Сначала успешная загрузка; затем регистрация ежедневного запуска.
-  const result = wbUpdateAll();
-  const pendingRetry = PropertiesService.getScriptProperties().getProperty('WB_RETRY_TRIGGER_ID');
+  const book = SpreadsheetApp.openById(WB.bookId);
+  wbSetupForecastSheet_(book);
+  const props = PropertiesService.getScriptProperties();
+  const pendingRetry = props.getProperty('WB_RETRY_TRIGGER_ID');
   const old = wbOwnTriggers_().filter(trigger => trigger.getUniqueId() !== pendingRetry);
   ScriptApp.newTrigger('wbUpdateAll').timeBased().everyDays(1)
     .atHour(4).inTimezone(WB.timezone).create();
   old.forEach(trigger => ScriptApp.deleteTrigger(trigger));
   onOpen();
-  wbToast_(result && result.deferred
-    ? 'Ежедневное обновление включено. Первая загрузка отложена из-за лимита WB; повтор запланирован.'
-    : 'Готово: обновление ежедневно между 04:00 и 05:00 МСК.');
+  wbToast_('Пустая вкладка прогноза подготовлена. Данные загрузятся при следующем обновлении WB.');
 }
 
 function wbSetupForecastSheet_(book) {
@@ -75,7 +73,8 @@ function wbSetupForecastSheet_(book) {
     'Заказ → выкуп, %','Себестоимость за единицу, ₽ (ввод)',
     'Реклама за период, ₽ (ввод)','Выручка выкупов, ₽',
     'Прибыль после себестоимости и рекламы, ₽','Прибыль на выкуп, ₽',
-    'Переход → заказ, %','Заказы / 10 тыс. показов','Выкупы / 10 тыс. показов'];
+    'Переход → заказ, %','Заказы / 10 тыс. показов','Выкупы / 10 тыс. показов',
+    'Период данных WB'];
   const nr = Math.max(out.getLastRow(), 1), nc = Math.max(out.getLastColumn(), h.length);
   const old = out.getRange(1, 1, nr, nc).getValues();
   if (!h.every((v, i) => old[0][i] === v) && old.some(r => r.some(v => v !== ''))) {
@@ -91,44 +90,17 @@ function wbSetupForecastSheet_(book) {
   const n = out.getMaxRows() - 1;
   out.getRange(2, 1, n, 1).setDataValidation(SpreadsheetApp.newDataValidation()
     .requireValueInRange(src.getRange(2, 3, end - 1, 1), true).setAllowInvalid(false).build());
-  const q = "'" + WB.sheet + "'!";
-  const productFormulas = [], funnelFormulas = [], profitFormulas = [], zeroAds = [];
-  for (let r = 2; r <= n + 1; r++) {
-    const match = `MATCH($A${r},${q}$C:$C,0)`;
-    productFormulas.push([
-      `=IF(A${r}="","",IFERROR(INDEX(${q}$B:$B,${match}),""))`,
-      `=IF(A${r}="","",IFERROR(INDEX(${q}$A:$A,${match}),""))`
-    ]);
-    funnelFormulas.push([
-      `=IFERROR(F${r}/D${r},"")`,
-      `=IF(A${r}="","",IFERROR(INDEX(${q}$AA:$AA,${match}),""))`,
-      `=IF(A${r}="","",IFERROR(INDEX(${q}$AB:$AB,${match}),""))`,
-      `=IF(A${r}="","",IFERROR(INDEX(${q}$AC:$AC,${match}),""))`,
-      `=IF(A${r}="","",IFERROR(INDEX(${q}$AD:$AD,${match}),""))`,
-      `=IFERROR(G${r}/F${r},"")`,`=IFERROR(H${r}/G${r},"")`,`=IFERROR(I${r}/H${r},"")`
-    ]);
-    zeroAds.push([0]);
-    profitFormulas.push([
-      `=IF(A${r}="","",IFERROR(INDEX(${q}$AE:$AE,${match}),""))`,
-      `=IF(OR(A${r}="",M${r}=""),"",O${r}-I${r}*M${r}-N${r})`,
-      `=IF(OR(A${r}="",I${r}=0,M${r}=""),"",(O${r}-N${r})/I${r}-M${r})`,
-      `=IFERROR(H${r}/F${r},"")`,
-      `=IF(OR(D${r}="",D${r}=0),"",10000*H${r}/D${r})`,
-      `=IF(OR(D${r}="",D${r}=0),"",10000*I${r}/D${r})`
-    ]);
-  }
-  out.getRange(2, 2, n, 2).setFormulas(productFormulas);
-  out.getRange(2, 5, n, 8).setFormulas(funnelFormulas);
-  out.getRange(2, 14, n, 1).setValues(zeroAds);
-  out.getRange(2, 15, n, 6).setFormulas(profitFormulas);
-  out.getRange(2, 4, n, 1).setNote('Введите показы за период данных WB; CTR считается как переходы / показы.');
-  out.getRange(2, 13, n, 1).setNote('Себестоимость за одну выкупленную единицу. Можно заполнить позже.');
-  out.getRange(2, 14, n, 1).setNote('Рекламные расходы за тот же период. Начальное значение — 0 ₽.');
+  // Только строка заголовков и список выбора. Ряды с данными остаются пустыми.
+  out.getRange(2, 4, n, 1).setNote('Введите показы за период отчёта WB; CTR будет рассчитан, если WB вернёт показы.');
+  out.getRange(2, 13, n, 1).setNote('Себестоимость одной выкупленной единицы. Можно заполнить позже.');
+  out.getRange(2, 14, n, 1).setNote('Расходы на рекламу за период. При пустом поле считаются равными 0 ₽.');
   out.getRange(2, 5, n, 1).setNumberFormat('0.00%');
   out.getRange(2, 10, n, 3).setNumberFormat('0.00%');
   out.getRange(2, 18, n, 1).setNumberFormat('0.00%');
   out.getRange(2, 13, n, 4).setNumberFormat('#,##0.00');
   out.getRange(2, 16, n, 2).setNumberFormat('#,##0.00');
+  out.getRange(2, 19, n, 2).setNumberFormat('#,##0.00');
+  return out;
 }
 
 function wbDisable() {
@@ -566,9 +538,71 @@ function wbWrite_(sheet, records, period) {
       start = end;
     }
   });
+  wbSyncForecast_(records, period);
   console.log('Заполнены существующие строки: ' + matched +
     '. Формулы, заголовки, структура и фильтры сохранены.');
   return matched;
+}
+
+function wbSyncForecast_(records, period) {
+  const book = SpreadsheetApp.openById(WB.bookId);
+  const sheet = book.getSheetByName('Прогноз по конверсиям');
+  if (!sheet || sheet.getRange('A1').getValue() !== 'Артикул WB' || sheet.getLastRow() < 2) return;
+  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  const col = new Map(headers.map((value, index) => [String(value).trim(), index + 1]));
+  const idCol = col.get('Артикул WB');
+  if (!idCol) return;
+  const selected = sheet.getRange(2, idCol, sheet.getLastRow() - 1, 1).getDisplayValues();
+  const byId = new Map(records.map(record => [record.id, record]));
+  const changes = new Map();
+  function put(row, heading, value) {
+    const column = col.get(heading);
+    if (!column || value === undefined) return;
+    if (!changes.has(column)) changes.set(column, []);
+    changes.get(column).push([row + 2, value]);
+  }
+  selected.forEach((cell, index) => {
+    const id = String(cell[0]).trim();
+    const record = byId.get(id);
+    if (!record) return;
+    const n = record.numbers, ratios = record.ratios, row = index + 2;
+    const openingRate = n[0] ? n[2] / n[0] : '';
+    const facts = {
+      'Товар': record.title, 'Тип товара': record.type,
+      'Переходы': n[0], 'Корзины': n[1], 'Заказы': n[2], 'Выкупы': n[3],
+      'Переход → корзина, %': ratios[0], 'Корзина → заказ, %': ratios[1],
+      'Заказ → выкуп, %': ratios[2], 'Переход → заказ, %': openingRate,
+      'Выручка выкупов, ₽': n[4], 'Период данных WB': wbPeriodLabel_(period)
+    };
+    Object.keys(facts).forEach(key => put(index, key, facts[key]));
+    const spendCol = col.get('Реклама за период, ₽ (ввод)');
+    if (spendCol && sheet.getRange(row, spendCol).getValue() === '') put(index, 'Реклама за период, ₽ (ввод)', 0);
+    const costCol = col.get('Себестоимость за единицу, ₽ (ввод)');
+    const cost = costCol ? sheet.getRange(row, costCol).getValue() : '';
+    const spend = spendCol ? Number(sheet.getRange(row, spendCol).getValue()) || 0 : 0;
+    if (cost !== '' && Number.isFinite(Number(cost))) {
+      put(index, 'Прибыль после себестоимости и рекламы, ₽', n[4] - n[3] * Number(cost) - spend);
+      if (n[3] > 0) put(index, 'Прибыль на выкуп, ₽', (n[4] - spend) / n[3] - Number(cost));
+    }
+    const formulas = [
+      `=IF(OR(D${row}="",D${row}=0),"",F${row}/D${row})`,
+      `=IF(OR(A${row}="",M${row}=""),"",O${row}-I${row}*M${row}-N${row})`,
+      `=IF(OR(A${row}="",I${row}=0,M${row}=""),"",(O${row}-N${row})/I${row}-M${row})`,
+      `=IFERROR(H${row}/F${row},"")`,
+      `=IF(OR(D${row}="",D${row}=0),"",10000*H${row}/D${row})`,
+      `=IF(OR(D${row}="",D${row}=0),"",10000*I${row}/D${row})`
+    ];
+    sheet.getRange(row, 5, 1, 1).setFormula(formulas[0]);
+    sheet.getRange(row, 15, 1, 6).setFormulas([[
+      `=${n[4]}`, formulas[1], formulas[2], formulas[3], formulas[4], formulas[5]
+    ]]);
+  });
+  changes.forEach((cells, column) => cells.forEach(cell =>
+    sheet.getRange(cell[0], column).setValue(cell[1])));
+  const periodCol = col.get('Период данных WB');
+  if (periodCol) selected.forEach((cell, index) => {
+    if (byId.has(String(cell[0]).trim())) sheet.getRange(index + 2, periodCol).setValue(wbPeriodLabel_(period));
+  });
 }
 
 function wbEmptyFormula_(sheet, row, column, formula) {
