@@ -52,7 +52,9 @@ function wbDisable() {
 }
 
 function wbReadPublic_(path) {
-  const response = UrlFetchApp.fetch(WB_LOADER.base + path, {
+    // GitHub кэширует веточную ссылку до пяти минут; уникальный query
+    // обеспечивает получение только что опубликованного release.json.
+  const response = UrlFetchApp.fetch(WB_LOADER.base + path + '?v=' + Date.now(), {
     method: 'get', muteHttpExceptions: true,
     followRedirects: false, validateHttpsCertificates: true
   });
