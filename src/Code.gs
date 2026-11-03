@@ -205,6 +205,7 @@ function wbUpdateAll() {
 
 function wbCheckForCodeChanges() {
   const props = PropertiesService.getScriptProperties();
+  wbProbePortalAccess_();
   wbJamCtrTick_(props);
   const loaded = props.getProperty('WB_LOADED_RELEASE_SHA');
   if (!loaded || loaded === props.getProperty('WB_ACTIVE_RELEASE_SHA')) return;
@@ -876,5 +877,31 @@ function wbProbeAdvertisingAccess_(token) {
   props.setProperty('WB_ADVERT_PROBE_STATUS',message);
   const sheet=SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
   if (sheet) sheet.getRange('D1').setNote(message);
+  console.log(message);
+}
+
+
+function wbProbePortalAccess_() {
+  const props=PropertiesService.getScriptProperties();
+  if (props.getProperty('WB_PORTAL_PROBE_V1')) return;
+  const token=props.getProperty('WB_API_TOKEN');
+  if (!token) return;
+  let message;
+  try {
+    const period=wbPeriod_(1);
+    const response=UrlFetchApp.fetch('https://seller-content.wildberries.ru/ns/analytics-api/content-analytics/api/v1/sales-funnel/report/details',{
+      method:'post',contentType:'application/json',headers:{Authorization:token},
+      payload:JSON.stringify({currentPeriod:period,subjects:[],brands:[],nms:[],tagIds:[],skipDeletedNm:true,orderBy:{field:'openCardCount',mode:'desc'},limit:1,offset:0}),
+      muteHttpExceptions:true,followRedirects:false,validateHttpsCertificates:true});
+    const status=response.getResponseCode();
+    message='Прямой запрос к общей воронке кабинета с существующим WB_API_TOKEN: HTTP '+status+'.';
+    if (status===200) {
+      try {message+=' Поля ответа: '+wbMetricPaths_(JSON.parse(response.getContentText())).join(', ');}
+      catch (_) {message+=' Ответ не JSON.';}
+    }
+    if (status!==429 && status<500) props.setProperty('WB_PORTAL_PROBE_V1',message);
+  } catch (_) {message='Прямой запрос к общей воронке: сетевой сбой.';}
+  const sheet=SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
+  if (sheet) sheet.getRange('F1').setNote(message);
   console.log(message);
 }
