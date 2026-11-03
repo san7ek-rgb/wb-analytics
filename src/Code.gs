@@ -1,8 +1,8 @@
 /**
  * WB → «Таблица конверсий». Вставить целиком в привязанный Apps Script.
  * Ключ: свойство скрипта WB_API_TOKEN. Установка: wbInstall.
- * Слева автоматически добавляется A «Тип товара». Старые столбцы сдвигаются.
- * B:X существующих строк не перезаписываются. Y:AW — блок интеграции.
+ * Обновляет только данные существующих строк по заголовкам первой строки.
+ * Не добавляет строки/столбцы и не перезаписывает формулы, заголовки, фильтры.
  * AO:AP — ручные показы и их период; API воронки их не предоставляет.
  * Это снимок выбранного периода, а не накопительный журнал по дням.
  */
@@ -114,6 +114,11 @@ function wbRun_(days) {
     }
     // Все страницы загружаются и проверяются до записи в таблицу.
     const records = products.map(item => wbRecord_(item, period));
+    // Те же ответы, что используются для загрузки; дополнительных запросов нет.
+    // Только имена полей, без ключа, значений или персональных данных.
+    const selectedFields = products[0].statistic.selected;
+    console.log('WB поля воронки: ' + Object.keys(selectedFields).sort().join(', '));
+    console.log('WB поля конверсий: ' + Object.keys(selectedFields.conversions || {}).sort().join(', '));
     const ids = new Set();
     records.forEach(record => {
       if (ids.has(record.id)) {
@@ -121,13 +126,12 @@ function wbRun_(days) {
       }
       ids.add(record.id);
     });
-    wbEnsureTypeColumn_(sheet);
-    wbWrite_(sheet, records, period);
+    const written = wbWrite_(sheet, records, period);
     SpreadsheetApp.flush();
     const now = Utilities.formatDate(new Date(), WB.timezone, 'yyyy-MM-dd HH:mm:ss');
     props.setProperties({ WB_LAST_SUCCESS: now, WB_LAST_ERROR: '' });
     wbClearRetry_(props);
-    wbToast_('Обновлено товаров: ' + records.length + '. Период: ' + wbPeriodLabel_(period));
+    wbToast_('Обновлено строк: ' + written + '. Период: ' + wbPeriodLabel_(period));
   } catch (error) {
     // Не записываем тела ответов WB, ключ или заголовки запросов в журнал.
     const message = error.message || 'Ошибка обновления WB.';
@@ -424,93 +428,81 @@ function wbRecord_(item, period) {
 function wbSafeText_(text) { return /^[=+@-]/.test(text) ? "'" + text : text; }
 
 function wbWrite_(sheet, records, period) {
-  const requiredCols = 23 + WB.headers.length;
-  const actualCols = requiredCols + wbColumnShift_(sheet);
-  if (sheet.getMaxColumns() < actualCols) {
-    sheet.insertColumnsAfter(sheet.getMaxColumns(), actualCols - sheet.getMaxColumns());
-  }
-  const last = Math.max(sheet.getLastRow(), 1);
-  const grid = wbRange_(sheet, 1, 1, last, requiredCols).getValues();
-  const formulas = wbRange_(sheet, 1, 1, last, 23).getFormulas();
-  const rowById = new Map();
-  const available = [];
-  for (let r = 1; r < grid.length; r++) {
-    const id = String(grid[r][1]).trim();
-    if (/^\d+$/.test(id)) {
-      if (rowById.has(id)) {
-        throw new Error('Повторяющийся артикул в B: ' + id + '. Устраните дубликат перед обновлением.');
-      }
-      rowById.set(id, r + 1);
-    } else if (grid[r].every(value => value === '') &&
-               formulas[r][0] === '' && formulas[r][1] === '') {
-      available.push(r + 1);
-    }
-  }
-  let append = last + 1;
-  const planned = records.map(record => ({
-    record: record,
-    row: rowById.get(record.id) || available.shift() || append++,
-    isNew: !rowById.has(record.id)
-  }));
-  const end = Math.max(last, ...planned.map(item => item.row));
-  if (end > sheet.getMaxRows()) {
-    sheet.insertRowsAfter(sheet.getMaxRows(), end - sheet.getMaxRows());
-  }
-  wbRange_(sheet, 1, 24, 1, WB.headers.length).setValues([WB.headers]);
-  const label = wbPeriodLabel_(period);
+  // Режим пользователя: только данные под существующими заголовками первой
+  // строки. Не вставляем строки/столбцы, не меняем формулы, фильтры и оформление.
+  const rows = sheet.getLastRow();
+  const columns = sheet.getLastColumn();
+  if (rows < 2) throw new Error('В таблице нет строк с артикулами. Структура не изменена.');
+  const range = sheet.getRange(1, 1, rows, columns);
+  const values = range.getValues();
+  const formulas = range.getFormulas();
+  const headers = new Map(values[0].map((value, index) => [String(value).trim(), index]));
+  const idColumn = headers.get('Артикул WB');
+  if (idColumn === undefined) throw new Error('Не найден заголовок «Артикул WB».');
+  const byId = new Map(records.map(record => [record.id, record]));
+  const updates = new Map();
   const now = Utilities.formatDate(new Date(), WB.timezone, 'yyyy-MM-dd HH:mm:ss');
-  const received = new Set(records.map(record => record.id));
-  planned.forEach(item => {
-    const r = item.row;
-    const record = item.record;
-    if (item.isNew) wbRange_(sheet, r, 1, 1, 2).setValues([[record.title, Number(record.id)]]);
-    if (wbColumnShift_(sheet)) sheet.getRange(r, 1).setValue(record.type);
-    const clickOrder = record.numbers[0] > 0
-      ? record.numbers[2] / record.numbers[0] : '';
-    wbRange_(sheet, r, 24, 1, 12).setValues([[
-      label, now, ...record.numbers, ...record.ratios, clickOrder
-    ]]);
-    wbRange_(sheet, r, 37, 1, 3).setValues([[
-      record.stockWB, record.stockMP, 'Обновлено'
-    ]]);
-    wbRange_(sheet, r, 48).setValue(record.title);
-    // В AN:AO ничего не записываем: это входные данные пользователя.
-    wbEmptyFormula_(sheet, r, 36,
-      '=IF(AND(AM' + r + '="Обновлено",ISNUMBER(I' + r + ')),AC' + r + '*I' + r + ',"")');
-    const valid = 'AND(AM' + r + '="Обновлено",ISNUMBER(AN' + r + '),AN' + r + '>0,AO' + r + '=X' + r + ')';
-    const calculated = [
-      '=IF(' + valid + ',Z' + r + '/AN' + r + ',"")',
-      '=IF(' + valid + ',10000*AB' + r + '/AN' + r + ',"")',
-      '=IF(AQ' + r + '="","",AQ' + r + '*AH' + r + ')',
-      '=IF(AND(AR' + r + '<>"",ISNUMBER(I' + r + ')),AR' + r + '*I' + r + ',"")',
-      '=IF(AS' + r + '="","",RANK(AS' + r + ',$AS$2:$AS,0))',
-      '=IF(AS' + r + '="","",IF(AS' + r + '=MAX($AS$2:$AS),"Лидер по прогнозу","Сравнить с лидером"))'
-    ];
-    calculated.forEach((formula, index) => wbEmptyFormula_(sheet, r, 42 + index, formula));
-  });
-  rowById.forEach((r, id) => {
-    if (!received.has(id) && grid[r - 1][23] !== '') {
-      wbRange_(sheet, r, 39).setValue('Не получен в текущем ответе — данные прежнего периода');
+  const periodText = wbPeriodLabel_(period);
+  let matched = 0;
+  function put(row, header, value) {
+    const column = headers.get(header);
+    if (column === undefined || formulas[row][column] !== '' || value === undefined) return;
+    if (values[row][column] === value) return;
+    if (!updates.has(column)) updates.set(column, []);
+    updates.get(column).push([row + 1, value]);
+  }
+  for (let r = 1; r < rows; r++) {
+    const id = String(values[r][idColumn]).trim();
+    if (!/^\d+$/.test(id)) continue;
+    const record = byId.get(id);
+    if (!record) {
+      const periodColumn = headers.get('WB: период');
+      if (periodColumn !== undefined && values[r][periodColumn] !== '') {
+        put(r, 'WB: статус', 'Не получен в текущем ответе — данные прежнего периода');
+      }
+      continue;
+    }
+    matched++;
+    const n = record.numbers;
+    const ratios = record.ratios;
+    const clickOrder = n[0] > 0 ? n[2] / n[0] : '';
+    const facts = {
+      'Тип товара': record.type,
+      'Товар': record.title,
+      'В корзину из кликов, %': ratios[0],
+      'В заказ из корзины, %': ratios[1],
+      'Выкуп, %': ratios[2],
+      // avgPrice — средняя цена заказов, не текущий прайс. При отсутствии
+      // заказов WB возвращает 0: сохранённую цену в таком случае не затираем.
+      'Цена, ₽': n[5] > 0 ? n[5] : undefined,
+      'Переходы': n[0], 'Корзины': n[1], 'Заказы': n[2], 'Выкупы': n[3],
+      'Выручка, ₽': n[4], 'Конверсия клик→заказ, %': clickOrder,
+      'WB: период': periodText, 'WB: обновлено (МСК)': now,
+      'WB: переходы': n[0], 'WB: корзины': n[1],
+      'WB: заказы': n[2], 'WB: выкупы': n[3],
+      'WB: выручка выкупов, ₽': n[4], 'WB: средняя цена, ₽': n[5],
+      'WB: в корзину, %': ratios[0], 'WB: в заказ, %': ratios[1],
+      'WB: выкуп, %': ratios[2], 'WB: заказ / переход, %': clickOrder,
+      'WB: остаток WB': record.stockWB, 'WB: остаток продавца': record.stockMP,
+      'WB: статус': 'Обновлено', 'WB: название товара': record.title
+    };
+    Object.keys(facts).forEach(header => put(r, header, facts[header]));
+  }
+  if (!matched) throw new Error('Артикулы из столбца «Артикул WB» не найдены в ответе WB. Ничего не изменено.');
+  // Пишем только изменившиеся ячейки без формул, объединяя смежные по столбцу.
+  updates.forEach((cells, column) => {
+    let start = 0;
+    while (start < cells.length) {
+      let end = start + 1;
+      while (end < cells.length && cells[end][0] === cells[end - 1][0] + 1) end++;
+      sheet.getRange(cells[start][0], column + 1, end - start, 1)
+        .setValues(cells.slice(start, end).map(cell => [cell[1]]));
+      start = end;
     }
   });
-  wbRange_(sheet, 1, 40).setNote(
-    'Общие показы воронка WB не возвращает. Введите показы из сопоставимого источника за период в столбце «WB: период» этой строки. Не смешивайте рекламные показы с общими переходами.'
-  );
-  wbRange_(sheet, 1, 41).setNote(
-    'Для расчётов скопируйте сюда текст из столбца «WB: период» той же строки. При смене периода старые показы автоматически исключаются из прогнозов.'
-  );
-  wbRange_(sheet, 1, 36).setNote(
-    'Расчёт: фактические выкупы WB × прибыль из столбца «Прибыль с выкупа». Это оценка по вашей марже, не финансовый отчёт WB. Маржа заполняется вручную.'
-  );
-  wbRange_(sheet, 1, 34).setNote(
-    'Процент выкупа WB исключает ещё доставляемые товары. Выкупы воронки относятся к выбранному периоду заказов и могут уточняться позднее.'
-  );
-  if (end > 1) {
-    wbRange_(sheet, 2, 32, end - 1, 4).setNumberFormat('0.00%');
-    wbRange_(sheet, 2, 42, end - 1, 1).setNumberFormat('0.00%');
-    wbRange_(sheet, 2, 43, end - 1, 3).setNumberFormat('0.00');
-  }
-  wbExpandFilter_(sheet, end, actualCols);
+  console.log('Заполнены существующие строки: ' + matched +
+    '. Формулы, заголовки, структура и фильтры сохранены.');
+  return matched;
 }
 
 function wbEmptyFormula_(sheet, row, column, formula) {
