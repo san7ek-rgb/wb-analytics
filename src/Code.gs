@@ -236,6 +236,7 @@ function wbRun_(days) {
     }
     const token = (props.getProperty('WB_API_TOKEN') || '').trim();
     if (!token) throw new Error('Добавьте WB_API_TOKEN в свойства скрипта.');
+    wbProbeAdvertisingAccess_(token);
     const sheet = wbSheet_();
     wbCheckLayout_(sheet);
     const period = wbPeriod_(days);
@@ -852,4 +853,28 @@ function wbJamCtrApply_(texts,period) {
     sheet.getRange(i+2,19,1,2).setValues([[t.shows>0?10000*Number(r[8])/t.shows:'',t.shows>0?10000*Number(r[10])/t.shows:'']]);updated++;
   });
   wbJamCtrNote_('Показы и CTR получены из расширенного CSV Джем. Обновлено артикулов: '+updated+'. Период '+wbPeriodLabel_(period));
+}
+
+
+// Read-only permission check using the existing token inside Apps Script.
+function wbProbeAdvertisingAccess_(token) {
+  const props=PropertiesService.getScriptProperties();
+  const today=Utilities.formatDate(new Date(),WB.timezone,'yyyy-MM-dd');
+  if (props.getProperty('WB_ADVERT_PROBE_DATE')===today) return;
+  let message;
+  try {
+    const response=UrlFetchApp.fetch('https://advert-api.wildberries.ru/adv/v1/promotion/count',{
+      headers:{Authorization:token},muteHttpExceptions:true,followRedirects:false});
+    const status=response.getResponseCode();
+    if (status===200) {
+      const data=JSON.parse(response.getContentText());
+      const total=typeof data.all==='number'?data.all:'не указан';
+      message='Проверка имеющегося WB_API_TOKEN: API Продвижение доступен (HTTP 200). Кампаний: '+total+'. Показы рекламных кампаний доступны отдельным методом /adv/v3/fullstats; это не общие показы воронки.';
+    } else message='Проверка имеющегося WB_API_TOKEN: API Продвижение вернул HTTP '+status+'. Ключ не изменялся.';
+    if (status!==429 && status<500) props.setProperty('WB_ADVERT_PROBE_DATE',today);
+  } catch (_) {message='Проверка имеющегося WB_API_TOKEN: не удалось связаться с API Продвижение.';}
+  props.setProperty('WB_ADVERT_PROBE_STATUS',message);
+  const sheet=SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
+  if (sheet) sheet.getRange('D1').setNote(message);
+  console.log(message);
 }
