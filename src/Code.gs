@@ -119,6 +119,22 @@ function wbSetupForecastSheet_(book) {
   out.getRange('W1').setBackground('#294954').setFontColor('#f4efdf').setFontWeight('bold');
   out.getRange('W2').setBackground('#d3e0e1').setFontColor('#243a40');
   out.setColumnWidth(23, 190);
+  const costHeaders = out.getRange(1, 24, 1, 3).getValues()[0];
+  const expectedCostHeaders = ['WB ID из файла себестоимости', 'Себестоимость из файла, ₽', 'Последняя дата в файле'];
+  if (costHeaders.every(value => value === '')) {
+    out.getRange(1, 24, 1, 3).setValues([expectedCostHeaders]);
+  } else if (!expectedCostHeaders.every((value, index) => costHeaders[index] === value)) {
+    throw new Error('Вспомогательные столбцы себестоимости X:Z заняты другими данными.');
+  }
+  const costBand = out.getRange(1, 24, out.getMaxRows(), 3)
+    .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
+  costBand.setHeaderRowColor('#294954');
+  costBand.setFirstRowColor('#e2ebeb');
+  costBand.setSecondRowColor('#d3e0e1');
+  out.getRange(1, 24, 1, 3).setFontColor('#f4efdf').setFontWeight('bold').setWrap(true);
+  out.getRange(1, 24, out.getMaxRows(), 3).setFontFamily('Arial');
+  out.setColumnWidths(24, 2, 205);
+  out.setColumnWidth(26, 150);
   // Заголовок и выпадающий список без заполнения рядов данными.
   out.getRange(2, 4, n, 1).setNote('Введите показы за период отчёта WB; CTR будет рассчитан, если WB вернёт показы.');
   out.getRange(2, 13, n, 1).setNote('Себестоимость одной выкупленной единицы. Можно заполнить позже.');
@@ -610,6 +626,12 @@ function wbSyncForecast_(records, period) {
   if (!idCol) return;
   const selected = sheet.getRange(2, idCol, sheet.getLastRow() - 1, 1).getDisplayValues();
   const byId = new Map(records.map(record => [record.id, record]));
+  const costRows = sheet.getRange(2, 24, Math.max(sheet.getLastRow() - 1, 1), 2).getValues();
+  const costsById = new Map();
+  costRows.forEach(row => {
+    const id = String(row[0]).trim(), amount = row[1];
+    if (/^\d+$/.test(id) && typeof amount === 'number' && amount >= 0) costsById.set(id, amount);
+  });
   const changes = new Map();
   function put(row, heading, value) {
     const column = col.get(heading);
@@ -634,7 +656,11 @@ function wbSyncForecast_(records, period) {
     const spendCol = col.get('Реклама за период, ₽ (ввод)');
     if (spendCol && sheet.getRange(row, spendCol).getValue() === '') put(index, 'Реклама за период, ₽ (ввод)', 0);
     const costCol = col.get('Себестоимость за единицу, ₽ (ввод)');
-    const cost = costCol ? sheet.getRange(row, costCol).getValue() : '';
+    let cost = costCol ? sheet.getRange(row, costCol).getValue() : '';
+    if ((cost === '' || cost === null) && costsById.has(id)) {
+      cost = costsById.get(id);
+      put(index, 'Себестоимость за единицу, ₽ (ввод)', cost);
+    }
     const spend = spendCol ? Number(sheet.getRange(row, spendCol).getValue()) || 0 : 0;
     if (cost !== '' && Number.isFinite(Number(cost))) {
       put(index, 'Прибыль после себестоимости и рекламы, ₽', n[4] - n[3] * Number(cost) - spend);
