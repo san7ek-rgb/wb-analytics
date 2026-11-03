@@ -205,6 +205,7 @@ function wbUpdateAll() {
 
 function wbCheckForCodeChanges() {
   const props = PropertiesService.getScriptProperties();
+  wbJamCtrTick_(props);
   const loaded = props.getProperty('WB_LOADED_RELEASE_SHA');
   if (!loaded || loaded === props.getProperty('WB_ACTIVE_RELEASE_SHA')) return;
   // Отмечаем выпуск перед обращением к WB, чтобы не запускать один и тот же
@@ -262,6 +263,7 @@ function wbRun_(days) {
     const now = Utilities.formatDate(new Date(), WB.timezone, 'yyyy-MM-dd HH:mm:ss');
     props.setProperties({ WB_LAST_SUCCESS: now, WB_LAST_ERROR: '' });
     wbClearRetry_(props);
+    wbJamCtrQueue_(period);
     wbToast_('Обновлено строк: ' + written + '. Период: ' + wbPeriodLabel_(period));
   } catch (error) {
     // Не записываем тела ответов WB, ключ или заголовки запросов в журнал.
@@ -761,4 +763,90 @@ function wbToast_(message) {
   console.log(message);
   try { SpreadsheetApp.openById(WB.bookId).toast(message, 'WB Аналитика', 10); }
   catch (_) { /* Журнал выполнения остаётся доступен и без интерфейса таблицы. */ }
+}
+
+
+// Extended seller CSV is generated asynchronously; one request per minute tick.
+function wbJamCtrNote_(message) {
+  const sheet=SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
+  if (sheet) sheet.getRange('E1').setNote(message);
+  console.log(message);
+}
+function wbJamCtrQueue_(period) {
+  const props=PropertiesService.getScriptProperties();
+  if (props.getProperty('WB_JAM_CTR_PERIOD') === wbPeriodLabel_(period)) return;
+  props.setProperty('WB_JAM_CTR_JOB',JSON.stringify({id:Utilities.getUuid(),period:period,stage:'create',attempts:0,next:0}));
+  wbJamCtrNote_('CTR: запрошена автоматическая проверка расширенного CSV Джем за '+wbPeriodLabel_(period));
+}
+function wbJamCtrTick_(props) {
+  const raw=props.getProperty('WB_JAM_CTR_JOB');
+  if (!raw) return;
+  const lock=LockService.getScriptLock();
+  if (!lock.tryLock(500)) return;
+  try {
+    const job=JSON.parse(props.getProperty('WB_JAM_CTR_JOB')||'null');
+    if (!job || Date.now() < job.next) return;
+    if (job.attempts >= 30) {props.deleteProperty('WB_JAM_CTR_JOB');wbJamCtrNote_('CTR: отчёт Джем не получен за 30 попыток.');return;}
+    job.attempts++;
+    const base='https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads';
+    const options={method:job.stage==='create'?'post':'get',headers:{Authorization:props.getProperty('WB_API_TOKEN')},muteHttpExceptions:true,followRedirects:false};
+    let url=base;
+    if (job.stage==='create') {
+      options.contentType='application/json';
+      options.payload=JSON.stringify({id:job.id,reportType:'DETAIL_HISTORY_REPORT',userReportName:'CTR automatic check',params:{nmIDs:[],startDate:job.period.start,endDate:job.period.end,timezone:WB.timezone,aggregationLevel:'day',skipDeletedNm:true}});
+    } else if (job.stage==='status') url+='?filter%5BdownloadIds%5D='+encodeURIComponent(job.id);
+    else url+='/file/'+encodeURIComponent(job.id);
+    const response=UrlFetchApp.fetch(url,options), status=response.getResponseCode();
+    if (status===429 || status>=500) {
+      job.next=Date.now()+Math.max(60000,wbRateLimitDelay_(response.getAllHeaders(),Date.now()));
+    } else if (status<200 || status>=300) {
+      props.deleteProperty('WB_JAM_CTR_JOB');wbJamCtrNote_('CTR: API расширенного отчёта Джем вернул HTTP '+status+'.');return;
+    } else if (job.stage==='create') {job.stage='status';job.next=Date.now()+60000;}
+    else if (job.stage==='status') {
+      const data=JSON.parse(response.getContentText()).data;
+      const item=Array.isArray(data)?data.find(x=>x.id===job.id):null;
+      if (item && String(item.status).trim()==='SUCCESS') job.stage='file';
+      else if (item && item.status==='FAILED') {props.deleteProperty('WB_JAM_CTR_JOB');wbJamCtrNote_('CTR: генерация отчёта Джем завершилась FAILED.');return;}
+      job.next=Date.now()+60000;
+    } else {
+      const blob=response.getBlob(), bytes=blob.getBytes();
+      const texts=bytes[0]===80 && bytes[1]===75?Utilities.unzip(blob).filter(b=>/\.csv$/i.test(b.getName())).map(b=>b.getDataAsString('UTF-8')):[response.getContentText('UTF-8')];
+      wbJamCtrApply_(texts,job.period);
+      props.setProperty('WB_JAM_CTR_PERIOD',wbPeriodLabel_(job.period));
+      props.deleteProperty('WB_JAM_CTR_JOB');return;
+    }
+    props.setProperty('WB_JAM_CTR_JOB',JSON.stringify(job));
+  } catch (_) {wbJamCtrNote_('CTR: ошибка обработки расширенного CSV; повтор при следующей проверке.');}
+  finally {lock.releaseLock();}
+}
+function wbJamCtrApply_(texts,period) {
+  const totals=new Map(), fields=new Set();
+  texts.forEach(text=>{
+    text=text.replace(/^\uFEFF/,'');
+    const first=text.split(/\r?\n/)[0], separator=first.split(';').length>first.split(',').length?';':',';
+    const rows=Utilities.parseCsv(text,separator), h=(rows.shift()||[]).map(x=>x.trim().toLowerCase().replace(/[\s_%-]/g,''));
+    h.forEach(x=>fields.add(x));
+    const index=names=>h.findIndex(x=>names.indexOf(x)>=0);
+    const id=index(['nmid','артикулwb']), shows=index(['impressions','impressioncount','showcount','showscount','shows','показы','количествопоказов']);
+    const opens=index(['opencardcount','opencard','clicks','переходывкарточку']), ctr=index(['ctr','ctrpercent']);
+    if (id<0 || shows<0) return;
+    rows.forEach(r=>{
+      const key=String(r[id]).trim(), n=x=>Number(String(x||'').replace(/\s/g,'').replace(',','.'));
+      const impressions=n(r[shows]);
+      if (!/^\d+$/.test(key) || !Number.isFinite(impressions) || impressions<0) return;
+      const clicks=opens>=0?n(r[opens]):ctr>=0?n(r[ctr])*impressions/100:NaN;
+      if (!Number.isFinite(clicks) || clicks<0) return;
+      const t=totals.get(key)||{shows:0,clicks:0};t.shows+=impressions;t.clicks+=clicks;totals.set(key,t);
+    });
+  });
+  if (!totals.size) {wbJamCtrNote_('Расширенный CSV Джем получен. Поля показов/CTR не найдены. Фактические заголовки: '+Array.from(fields).join(', '));return;}
+  const sheet=SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
+  const rows=sheet.getRange(2,1,sheet.getLastRow()-1,22).getValues();let updated=0;
+  rows.forEach((r,i)=>{
+    const t=totals.get(String(r[0]));
+    if (!t || r[20]!==wbPeriodLabel_(period)) return;
+    sheet.getRange(i+2,4,1,2).setValues([[t.shows,t.shows>0?t.clicks/t.shows:'']]);
+    sheet.getRange(i+2,19,1,2).setValues([[t.shows>0?10000*Number(r[8])/t.shows:'',t.shows>0?10000*Number(r[10])/t.shows:'']]);updated++;
+  });
+  wbJamCtrNote_('Показы и CTR получены из расширенного CSV Джем. Обновлено артикулов: '+updated+'. Период '+wbPeriodLabel_(period));
 }
