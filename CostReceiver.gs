@@ -14,6 +14,7 @@ function doPost(e) {
     request = JSON.parse(e.postData.contents);
   } catch (_) { return reply({ok:false,error:'Invalid JSON'}); }
   if (!secret || secret.length < 32 || request.token !== secret) return reply({ok:false,error:'Unauthorized'});
+  if (request.action === 'funnel') return wbReceiveFunnel_(request, reply, props);
   if (request.schema !== 1 || !Array.isArray(request.costs) || !request.costs.length || request.costs.length > 5000) {
     return reply({ok:false,error:'Invalid schema'});
   }
@@ -77,5 +78,89 @@ function doPost(e) {
     return reply({ok:true,imported:imported,updated:updated,skippedOlder:skippedOlder});
   } catch (_) {
     return reply({ok:false,error:'Write failed; inspect Apps Script execution log'});
+  } finally { lock.releaseLock(); }
+}
+
+/** Accepts only normalized funnel metrics and writes existing cells on the two analytics tabs. */
+function wbReceiveFunnel_(request, reply, props) {
+  if (request.schema !== 1 || !/^\d{4}-\d{2}-\d{2}$/.test(request.start) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(request.end) || request.start > request.end ||
+      !Array.isArray(request.rows) || !request.rows.length || request.rows.length > 1000) {
+    return reply({ok:false,error:'Invalid funnel schema'});
+  }
+  const seen = new Set();
+  for (const row of request.rows) {
+    if (!row || !/^\d{1,16}$/.test(String(row.id)) || seen.has(String(row.id)) ||
+        !Number.isSafeInteger(row.impressions) || row.impressions < 0 || row.impressions > 1000000000 ||
+        !Number.isFinite(row.ctr) || row.ctr < 0 || row.ctr > 1 ||
+        !['clicks','carts','orders','buyouts'].every(k => Number.isSafeInteger(row[k]) && row[k] >= 0 && row[k] <= 1000000000)) {
+      return reply({ok:false,error:'Invalid funnel row'});
+    }
+    seen.add(String(row.id));
+  }
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return reply({ok:false,error:'Busy; retry later'});
+  try {
+    const bookId = props.getProperty('WB_SPREADSHEET_ID');
+    if (!bookId) return reply({ok:false,error:'Run wbInstall first'});
+    const book = SpreadsheetApp.openById(bookId);
+    const forecast = book.getSheetByName('Прогноз по конверсиям');
+    const source = book.getSheetByName('Рабочая табличка');
+    if (!forecast || !source) return reply({ok:false,error:'Required analytics tab missing'});
+    let updatedForecast = 0, updatedSource = 0;
+    const byId = new Map(request.rows.map(row => [String(row.id), row]));
+
+    // Forecast layout uses fixed headers established by wbInstall. Only existing
+    // product rows and non-formula cells are eligible for updates.
+    if (forecast.getLastRow() >= 2) {
+      const n = forecast.getLastRow() - 1;
+      const values = forecast.getRange(1, 1, n + 1, 22).getValues();
+      const formulas = forecast.getRange(1, 1, n + 1, 22).getFormulas();
+      const expected = ['Артикул WB','Показы (ввод)','CTR, %','Переходы','Корзины','Заказы','Выкупы','Период данных WB'];
+      const cols = [0,3,4,5,6,8,10,20];
+      if (!expected.every((h,i) => String(values[0][cols[i]]).trim() === h)) {
+        return reply({ok:false,error:'Forecast headers mismatch; nothing written'});
+      }
+      for (let r = 1; r < values.length; r++) {
+        const item = byId.get(String(values[r][0]).trim());
+        if (!item) continue;
+        const writes = [[3,item.impressions],[4,item.ctr],[5,item.clicks],[6,item.carts],
+          [8,item.orders],[10,item.buyouts],[20,request.start+' — '+request.end]];
+        writes.forEach(([c,v]) => {
+          if (!formulas[r][c] && values[r][c] !== v) {
+            forecast.getRange(r + 1, c + 1).setValue(v);
+            updatedForecast++;
+          }
+        });
+      }
+    }
+
+    // Source-tab impressions/CTR are updated only when a recognized existing
+    // heading is present. Other funnel figures continue through the official WB API.
+    if (source.getLastRow() >= 2) {
+      const rows = source.getLastRow(), cols = source.getLastColumn();
+      const values = source.getRange(1, 1, rows, cols).getValues();
+      const formulas = source.getRange(1, 1, rows, cols).getFormulas();
+      const headers = new Map(values[0].map((v,i) => [String(v).trim(),i]));
+      const idCol = headers.get('Артикул WB');
+      if (idCol === undefined) return reply({ok:false,error:'Source product ID header missing'});
+      const impressionCol = ['Показы','Показы, шт','Показы карточки','Количество показов']
+        .map(h => headers.get(h)).find(c => c !== undefined);
+      const ctrCol = ['CTR','CTR, %','CTR (%)'].map(h => headers.get(h)).find(c => c !== undefined);
+      for (let r = 1; r < values.length; r++) {
+        const item = byId.get(String(values[r][idCol]).trim());
+        if (!item) continue;
+        [[impressionCol,item.impressions],[ctrCol,item.ctr]].forEach(([c,v]) => {
+          if (c !== undefined && !formulas[r][c] && values[r][c] !== v) {
+            source.getRange(r + 1, c + 1).setValue(v);
+            updatedSource++;
+          }
+        });
+      }
+    }
+    SpreadsheetApp.flush();
+    return reply({ok:true,received:request.rows.length,updatedForecast:updatedForecast,updatedSource:updatedSource});
+  } catch (_) {
+    return reply({ok:false,error:'Funnel write failed; inspect Apps Script execution log'});
   } finally { lock.releaseLock(); }
 }
