@@ -20,14 +20,10 @@ PAGE_SIZE = 100
 FETCH_SCRIPT = r"""
 const [url, payload] = arguments;
 const done = arguments[arguments.length - 1];
-const token = localStorage.getItem('portal.seller-token');
-if (!token) { done({status:401, text:'Seller portal token missing'}); return; }
-const send = authorization => fetch(url, {method:'POST', credentials:'include',
-  headers:{'Content-Type':'application/json','Authorization':authorization,'Authorizationv3':authorization},
-  body:JSON.stringify(payload)})
-  .then(async r => ({status:r.status, text:await r.text()}));
-send(token).then(r => r.status === 401 ? send('Bearer ' + token) : r)
-  .then(r => done(r)).catch(e => done({status:0, text:String(e)}));
+fetch(url, {method:'POST', credentials:'include',
+  headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+  .then(async r => done({status:r.status, text:await r.text()}))
+  .catch(() => done({status:0, text:'Browser fetch failed'}));
 """
 
 def fail(message):
