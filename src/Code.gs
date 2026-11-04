@@ -213,7 +213,7 @@ function wbCheckForCodeChanges() {
   // неудачный запрос каждую минуту. При HTTP 429 сработает штатный отложенный повтор.
   props.setProperty('WB_ACTIVE_RELEASE_SHA', loaded);
   wbToast_('Новый код WB найден. Запускаю обновление данных.');
-  wbSetupForecastSheet_(SpreadsheetApp.openById(WB.bookId));
+  // Existing values and formulas are not rebuilt when a release changes.
   return wbUpdateAll();
 }
 
@@ -675,6 +675,7 @@ function wbWrite_(sheet, records, period) {
 }
 
 function wbSyncForecast_(records, period) {
+  if (PropertiesService.getScriptProperties().getProperty('WB_COMPARISON_JOB')) return;
   const book = SpreadsheetApp.openById(WB.bookId);
   const sheet = book.getSheetByName('Прогноз по конверсиям');
   if (!sheet || sheet.getRange('A1').getValue() !== 'Артикул WB' || sheet.getLastRow() < 2) return;
@@ -711,7 +712,11 @@ function wbSyncForecast_(records, period) {
     row[19]=Number(row[3])>0?10000*n[3]/Number(row[3]):'';
     row[20]=wbPeriodLabel_(period);
   });
-  if (matches) sheet.getRange(2,1,output.length,22).setValues(output);
+  if (matches) {
+    const preserved=sheet.getRange(2,1,output.length,22).getFormulas();
+    output.forEach((row,r)=>row.forEach((value,c)=>{if(preserved[r][c]) output[r][c]=preserved[r][c];}));
+    sheet.getRange(2,1,output.length,22).setValues(output);
+  }
   console.log('Обновлено строк прогноза: '+matches+' из '+output.length+'.');
 }
 
@@ -825,6 +830,7 @@ function wbJamCtrTick_(props) {
   finally {lock.releaseLock();}
 }
 function wbJamCtrApply_(texts,period) {
+  if (PropertiesService.getScriptProperties().getProperty('WB_COMPARISON_JOB')) return;
   const totals=new Map(), fields=new Set();
   texts.forEach(text=>{
     text=text.replace(/^\uFEFF/,'');

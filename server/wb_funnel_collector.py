@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import websocket
+import fcntl
 from datetime import date, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -29,7 +30,7 @@ fetch(url, {method:'POST', credentials:'include',
 
 def fail(message):
     print(message, file=sys.stderr, flush=True)
-    raise SystemExit(1)
+    raise SystemExit(message)
 
 def find_direct_id(obj):
     if not isinstance(obj, dict):
@@ -86,6 +87,7 @@ def flatten_rows(root):
                 "carts": find_metric(item, ("addToCart", "addToCartCount", "cartCount", "addToCartCountAll")),
                 "orders": find_metric(item, ("orderCount", "ordersCount", "orders")),
                 "buyouts": find_metric(item, ("buyoutCount", "buyoutsCount", "buyouts")),
+                "revenue": find_metric(item, ("buyoutSum",)),
             }
             if metrics["impressions"] is not None:
                 found[product_id] = metrics
@@ -111,6 +113,7 @@ def flatten_rows(root):
             "carts": int(m["carts"] or 0),
             "orders": int(m["orders"] or 0),
             "buyouts": int(m["buyouts"] or 0),
+            "revenue": m["revenue"],
         })
     return rows
 
@@ -167,8 +170,8 @@ def get_portal_data(driver, start, end, target_ids):
             "currentPeriod": {"start": start, "end": end},
             "subjects": [], "brands": [], "nms": [int(i) for i in batch], "tagIds": [],
             "skipDeletedNm": False,
-            "prevPeriod": {"start": (date.fromisoformat(start) - timedelta(days=1)).isoformat(),
-                           "end": (date.fromisoformat(end) - timedelta(days=1)).isoformat()},
+            "prevPeriod": {"start": (date.fromisoformat(start) - timedelta(days=(date.fromisoformat(end)-date.fromisoformat(start)).days+1)).isoformat(),
+                           "end": (date.fromisoformat(start) - timedelta(days=1)).isoformat()},
             "orderBy": {"field": "orders", "mode": "desc"},
         }
         headers = {k: v for k, v in captured_headers.items()
@@ -197,12 +200,12 @@ def get_portal_data(driver, start, end, target_ids):
     dedup = {row["id"]: row for row in result}
     return list(dedup.values())
 
-def send_to_sheet(start, end, rows):
+def send_to_sheet(start, end, rows, job_id=None):
     token = os.environ.get("WB_COST_RECEIVER_TOKEN", "").strip()
     if len(token) < 32:
         fail("Receiver secret is not configured. No spreadsheet data was sent.")
     body = json.dumps({"schema": 1, "action": "funnel", "token": token,
-                       "start": start, "end": end, "rows": rows}).encode()
+                       "start": start, "end": end, "rows": rows, "jobId": job_id}).encode()
     request = Request(RECEIVER_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urlopen(request, timeout=90) as response:
@@ -231,14 +234,46 @@ def get_catalog():
     print(f"Catalog: {len(ids)} selected of {catalog.get('total', len(ids))}; limit 300", flush=True)
     return ids
 
+def receiver_action(action, **values):
+    token = os.environ.get("WB_COST_RECEIVER_TOKEN", "").strip()
+    if len(token) < 32:
+        fail("Receiver secret is not configured.")
+    body = json.dumps({"schema": 1, "action": action, "token": token, **values}).encode()
+    try:
+        with urlopen(Request(RECEIVER_URL, data=body, headers={"Content-Type":"application/json"}), timeout=90) as r:
+            result = json.loads(r.read().decode())
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        fail("Comparison receiver request failed. Check the deployed Apps Script version.")
+    if not result.get("ok"):
+        fail("Comparison receiver declined the action. Check its deployment.")
+    return result
+
+
+def report_job_error(job, message):
+    if job:
+        try:
+            receiver_action("jobError", jobId=job["id"], message=message[:250])
+        except (Exception, SystemExit):
+            print("Could not update comparison error status; inspect server journal.", flush=True)
+
+
 def main():
+    job = None
+    if "--poll" in sys.argv:
+        job = receiver_action("task").get("job")
+        if not job:
+            return
     profile = os.environ.get("WB_FIREFOX_PROFILE", "/home/reportdeploy/wb-automation/profile")
     if not os.path.isdir(profile):
+        report_job_error(job, "Dedicated Firefox profile directory is missing.")
         fail("Dedicated Firefox profile directory is missing.")
-    # The server uses UTC; WB reporting period is Moscow calendar time.
     from datetime import datetime
-    moscow_yesterday = datetime.now(ZoneInfo("Europe/Moscow")).date() - timedelta(days=1)
-    day = moscow_yesterday.isoformat()
+    day = (datetime.now(ZoneInfo("Europe/Moscow")).date() - timedelta(days=1)).isoformat()
+    start, end = (job["start"], job["end"]) if job else (day, day)
+    target_ids = job["ids"] if job else get_catalog()
+    if len(target_ids) > 300 or not target_ids or any(not isinstance(i,str) or not i.isdigit() for i in target_ids):
+        report_job_error(job, "Invalid comparison article list.")
+        fail("Invalid comparison article list.")
     options = Options()
     options.set_capability("webSocketUrl", True)
     options.binary_location = "/usr/bin/firefox"
@@ -246,26 +281,42 @@ def main():
     options.add_argument("--no-remote")
     options.add_argument("-profile")
     options.add_argument(profile)
-    target_ids = get_catalog()
     driver = None
     try:
+        print(f"Collecting {len(target_ids)} articles: {start} — {end}", flush=True)
         driver = webdriver.Firefox(options=options)
         driver.set_page_load_timeout(60)
-        rows = get_portal_data(driver, day, day, target_ids)
+        driver.set_script_timeout(90)
+        rows = get_portal_data(driver, start, end, target_ids)
         received_ids = {row["id"] for row in rows}
         print(f"Coverage: {len(received_ids)}/{len(target_ids)}; missing articles retain previous values", flush=True)
-    except SystemExit:
-        raise
-    except Exception as exc:
-        # Avoid printing driver/browser exceptions: they can include local paths.
-        fail(f"Browser collection failed ({type(exc).__name__}). No spreadsheet data was sent.")
+    except SystemExit as error:
+        report_job_error(job, str(error))
+        raise SystemExit(1)
+    except Exception as error:
+        message = f"Browser collection failed ({type(error).__name__}). No spreadsheet data was sent."
+        report_job_error(job, message)
+        fail(message)
     finally:
         if driver:
             try:
                 driver.quit()
             except Exception:
                 pass
-    send_to_sheet(day, day, rows)
+    try:
+        send_to_sheet(start, end, rows, job["id"] if job else None)
+    except SystemExit as error:
+        report_job_error(job, str(error))
+        raise SystemExit(1)
+
 
 if __name__ == "__main__":
-    main()
+    # Daily collection and minute polling share one persistent Firefox profile.
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".collector.lock")
+    with open(lock_path, "a") as collector_lock:
+        try:
+            fcntl.flock(collector_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another collection owns the profile; next timer will retry.", flush=True)
+            raise SystemExit(0)
+        main()

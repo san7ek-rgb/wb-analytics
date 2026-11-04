@@ -23,7 +23,7 @@ if [[ ! "$WB_RECEIVER_TOKEN" =~ ^[A-Za-z0-9_-]{32,128}$ ]]; then
   exit 1
 fi
 
-install -d -o reportdeploy -g reportdeploy -m 700 "$APP_DIR"
+install -d -o reportdeploy -g reportdeploy -m 700 "$APP_DIR" /home/reportdeploy/.cache/selenium
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"; unset WB_RECEIVER_TOKEN' EXIT
 for file in wb_funnel_collector.py wb-funnel.service wb-funnel.timer; do
