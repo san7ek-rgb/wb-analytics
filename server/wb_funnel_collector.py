@@ -13,7 +13,7 @@ from selenium import webdriver
 from selenium.webdriver.firefox.options import Options
 
 PORTAL_URL = "https://seller.wildberries.ru/content-analytics/interactive-report/main"
-DETAILS_URL = "https://seller-content.wildberries.ru/ns/analytics-api/content-analytics/api/v1/sales-funnel/report/details"
+DETAILS_URL = "https://seller-content.wildberries.ru/ns/analytics-api/content-analytics/api/v1/sales-funnel/report"
 RECEIVER_URL = "https://script.google.com/macros/s/AKfycbyj_4_nwplUCYyEjDwHDOZqDhfSZjkpB57PBlhunkMOkpnPvAeTUozb1rxgrUciE2Dc/exec"
 PAGE_SIZE = 100
 
@@ -23,7 +23,7 @@ const done = arguments[arguments.length - 1];
 const token = localStorage.getItem('portal.seller-token');
 if (!token) { done({status:401, text:'Seller portal token missing'}); return; }
 const send = authorization => fetch(url, {method:'POST', credentials:'include',
-  headers:{'Content-Type':'application/json','Authorization':authorization},
+  headers:{'Content-Type':'application/json','Authorization':authorization,'Authorizationv3':authorization},
   body:JSON.stringify(payload)})
   .then(async r => ({status:r.status, text:await r.text()}));
 send(token).then(r => r.status === 401 ? send('Bearer ' + token) : r)
@@ -59,6 +59,10 @@ def find_metric(obj, names):
             for key, child in value.items():
                 if key.lower() in wanted and isinstance(child, (int, float)) and not isinstance(child, bool):
                     return float(child)
+                if key.lower() in wanted and isinstance(child, dict):
+                    current = child.get("current")
+                    if isinstance(current, (int, float)) and not isinstance(current, bool):
+                        return float(current)
                 if isinstance(child, (dict, list)):
                     stack.append(child)
         elif isinstance(value, list):
@@ -81,8 +85,8 @@ def flatten_rows(root):
             metrics = {
                 "impressions": find_metric(item, ("viewCount", "views", "impressions", "impressionCount", "showCount")),
                 "ctr": find_metric(item, ("viewToOpenConversion", "ctr", "ctrPercent", "clickThroughRate")),
-                "clicks": find_metric(item, ("openCardCount", "openCount", "clicks", "clickCount")),
-                "carts": find_metric(item, ("addToCartCount", "cartCount", "addToCartCountAll")),
+                "clicks": find_metric(item, ("openCard", "openCardCount", "openCount", "clicks", "clickCount")),
+                "carts": find_metric(item, ("addToCart", "addToCartCount", "cartCount", "addToCartCountAll")),
                 "orders": find_metric(item, ("orderCount", "ordersCount", "orders")),
                 "buyouts": find_metric(item, ("buyoutCount", "buyoutsCount", "buyouts")),
             }
@@ -95,7 +99,9 @@ def flatten_rows(root):
     for product_id, m in found.items():
         impressions = int(m["impressions"] or 0)
         clicks = int(m["clicks"] or 0)
-        ctr = m["ctr"]
+        if any(m[k] is None for k in ("clicks", "carts", "orders", "buyouts")):
+            fail("A product is missing required funnel fields; nothing was sent.")
+        ctr = clicks / impressions if impressions else 0
         if ctr is None:
             ctr = clicks / impressions if impressions else 0
         elif ctr > 1:
@@ -118,13 +124,14 @@ def get_portal_data(driver, start, end):
         fail("WB session needs sign-in again. Open Firefox on the server and sign in.")
     result = []
     offset = 0
-    for _ in range(20):
+    for _ in range(1):
         payload = {
             "currentPeriod": {"start": start, "end": end},
             "subjects": [], "brands": [], "nms": [], "tagIds": [],
-            "skipDeletedNm": True,
-            "orderBy": {"field": "openCardCount", "mode": "desc"},
-            "limit": PAGE_SIZE, "offset": offset,
+            "skipDeletedNm": False,
+            "prevPeriod": {"start": (date.fromisoformat(start) - timedelta(days=1)).isoformat(),
+                           "end": (date.fromisoformat(end) - timedelta(days=1)).isoformat()},
+            "orderBy": {"field": "orders", "mode": "desc"},
         }
         response = driver.execute_async_script(FETCH_SCRIPT, DETAILS_URL, payload)
         if not response or response.get("status") != 200:
