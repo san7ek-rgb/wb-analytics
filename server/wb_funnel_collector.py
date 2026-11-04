@@ -19,10 +19,10 @@ RECEIVER_URL = "https://script.google.com/macros/s/AKfycbyj_4_nwplUCYyEjDwHDOZqD
 PAGE_SIZE = 100
 
 FETCH_SCRIPT = r"""
-const [url, payload] = arguments;
+const [url, payload, headers] = arguments;
 const done = arguments[arguments.length - 1];
 fetch(url, {method:'POST', credentials:'include',
-  headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+  headers:headers, body:JSON.stringify(payload)})
   .then(async r => done({status:r.status, text:await r.text()}))
   .catch(() => done({status:0, text:'Browser fetch failed'}));
 """
@@ -119,7 +119,7 @@ def get_portal_data(driver, start, end):
     captured_headers = None
     try:
         ws.send(json.dumps({"id": 1, "method": "session.subscribe",
-                            "params": {"events": ["network.beforeRequestSent"]}}))
+                            "params": {"events": ["network.beforeRequestSent", "network.responseCompleted"]}}))
         ack = json.loads(ws.recv())
         if ack.get("type") == "error":
             fail("Firefox network subscription failed. Nothing was sent.")
@@ -143,6 +143,16 @@ def get_portal_data(driver, start, end):
                     v = c["value"]
                     return v.get("value", "") if isinstance(v, dict) else v
                 captured_headers["Cookie"] = "; ".join(c["name"] + "=" + cookie_value(c) for c in req["cookies"])
+            request_id = req.get("request")
+            while time.monotonic() < deadline:
+                completed = json.loads(ws.recv())
+                params = completed.get("params", {})
+                if completed.get("method") == "network.responseCompleted" and params.get("request", {}).get("request") == request_id:
+                    live_status = params.get("response", {}).get("status")
+                    print(f"Live Firefox report request: HTTP {live_status}", flush=True)
+                    if live_status != 200:
+                        fail("The automation Firefox profile itself is not receiving a successful report. Nothing was sent.")
+                    break
             break
     except (websocket.WebSocketTimeoutException, KeyError):
         fail("No live report request was captured. Open the report in the automation profile and verify sign-in.")
@@ -161,16 +171,11 @@ def get_portal_data(driver, start, end):
                            "end": (date.fromisoformat(end) - timedelta(days=1)).isoformat()},
             "orderBy": {"field": "orders", "mode": "desc"},
         }
-        headers = dict(captured_headers)
+        headers = {k: v for k, v in captured_headers.items()
+                   if k.lower() not in ("cookie", "origin", "referer", "user-agent", "content-length", "host", "connection", "accept-encoding")
+                   and not k.lower().startswith("sec-")}
         headers["Content-Type"] = "application/json"
-        req = Request(DETAILS_URL, data=json.dumps(payload).encode(), headers=headers, method="POST")
-        try:
-            with urlopen(req, timeout=60) as remote:
-                response = {"status": remote.status, "text": remote.read().decode("utf-8")}
-        except HTTPError as error:
-            response = {"status": error.code, "text": ""}
-        except (URLError, TimeoutError):
-            fail("Server HTTP connection to WB failed. No spreadsheet data was sent.")
+        response = driver.execute_async_script(FETCH_SCRIPT, DETAILS_URL, payload, headers)
         if not response or response.get("status") != 200:
             status = response.get("status", "no response") if response else "no response"
             fail(f"WB funnel request failed (HTTP {status}). No spreadsheet data was sent.")
