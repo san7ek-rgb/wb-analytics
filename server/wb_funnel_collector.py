@@ -129,7 +129,19 @@ def get_portal_data(driver, start, end):
                            "end": (date.fromisoformat(end) - timedelta(days=1)).isoformat()},
             "orderBy": {"field": "orders", "mode": "desc"},
         }
-        response = driver.execute_async_script(FETCH_SCRIPT, DETAILS_URL, payload)
+        cookie_header = "; ".join(c["name"] + "=" + c["value"] for c in driver.get_cookies()
+                                  if "wildberries.ru" in c.get("domain", ""))
+        headers = {"Content-Type": "application/json", "Cookie": cookie_header,
+                   "Origin": "https://seller.wildberries.ru", "Referer": PORTAL_URL,
+                   "User-Agent": driver.execute_script("return navigator.userAgent")}
+        req = Request(DETAILS_URL, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=60) as remote:
+                response = {"status": remote.status, "text": remote.read().decode("utf-8")}
+        except HTTPError as error:
+            response = {"status": error.code, "text": ""}
+        except (URLError, TimeoutError):
+            fail("Server HTTP connection to WB failed. No spreadsheet data was sent.")
         if not response or response.get("status") != 200:
             status = response.get("status", "no response") if response else "no response"
             fail(f"WB funnel request failed (HTTP {status}). No spreadsheet data was sent.")
