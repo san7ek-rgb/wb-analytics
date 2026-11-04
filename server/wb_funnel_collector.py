@@ -114,7 +114,7 @@ def flatten_rows(root):
         })
     return rows
 
-def get_portal_data(driver, start, end):
+def get_portal_data(driver, start, end, target_ids):
     ws = websocket.create_connection(driver.capabilities["webSocketUrl"], timeout=45, suppress_origin=True)
     captured_headers = None
     try:
@@ -161,11 +161,11 @@ def get_portal_data(driver, start, end):
     if not captured_headers:
         fail("No live report request was captured. Nothing was sent.")
     result = []
-    offset = 0
-    for _ in range(1):
+    for batch_start in range(0, len(target_ids), 25):
+        batch = target_ids[batch_start:batch_start + 25]
         payload = {
             "currentPeriod": {"start": start, "end": end},
-            "subjects": [], "brands": [], "nms": [], "tagIds": [],
+            "subjects": [], "brands": [], "nms": [int(i) for i in batch], "tagIds": [],
             "skipDeletedNm": False,
             "prevPeriod": {"start": (date.fromisoformat(start) - timedelta(days=1)).isoformat(),
                            "end": (date.fromisoformat(end) - timedelta(days=1)).isoformat()},
@@ -183,11 +183,15 @@ def get_portal_data(driver, start, end):
             data = json.loads(response["text"])
         except (KeyError, json.JSONDecodeError):
             fail("WB funnel response was not JSON. No spreadsheet data was sent.")
+        if data.get("error"):
+            fail("WB reported an error in a product batch. No spreadsheet data was sent.")
         page = flatten_rows(data)
+        if any(row["id"] not in batch for row in page):
+            fail("WB did not respect the article filter. No spreadsheet data was sent.")
         result.extend(page)
-        if len(page) < PAGE_SIZE:
-            break
-        offset += PAGE_SIZE
+        print(f"Batch {batch_start // 25 + 1}: requested {len(batch)}, received {len(page)}", flush=True)
+        if batch_start + 25 < len(target_ids):
+            time.sleep(3)
     if not result:
         fail("No product rows with impressions found in WB response. Nothing was sent.")
     dedup = {row["id"]: row for row in result}
@@ -209,6 +213,24 @@ def send_to_sheet(start, end, rows):
         fail("Sheet receiver declined the update. Check its response in Apps Script execution log.")
     print(f"OK: {result.get('received', 0)} products sent; forecast cells updated: {result.get('updatedForecast', 0)}; source cells updated: {result.get('updatedSource', 0)}; period {start} — {end}", flush=True)
 
+def get_catalog():
+    token = os.environ.get("WB_COST_RECEIVER_TOKEN", "").strip()
+    if len(token) < 32:
+        fail("Receiver secret is not configured.")
+    body = json.dumps({"schema": 1, "action": "catalog", "token": token}).encode()
+    try:
+        with urlopen(Request(RECEIVER_URL, data=body, headers={"Content-Type":"application/json"}), timeout=90) as r:
+            catalog = json.loads(r.read().decode())
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        fail("Cannot read product IDs from sheet receiver. Nothing was sent to WB.")
+    ids = catalog.get("ids")
+    if not catalog.get("ok") or not isinstance(ids, list) or not ids or len(ids) > 300:
+        fail("Update the deployed Apps Script receiver: catalog action unavailable or sheet has no IDs.")
+    if any(not isinstance(i, str) or not i.isdigit() or len(i) > 16 for i in ids):
+        fail("Invalid product ID list. Nothing was sent to WB.")
+    print(f"Catalog: {len(ids)} selected of {catalog.get('total', len(ids))}; limit 300", flush=True)
+    return ids
+
 def main():
     profile = os.environ.get("WB_FIREFOX_PROFILE", "/home/reportdeploy/wb-automation/profile")
     if not os.path.isdir(profile):
@@ -224,11 +246,14 @@ def main():
     options.add_argument("--no-remote")
     options.add_argument("-profile")
     options.add_argument(profile)
+    target_ids = get_catalog()
     driver = None
     try:
         driver = webdriver.Firefox(options=options)
         driver.set_page_load_timeout(60)
-        rows = get_portal_data(driver, day, day)
+        rows = get_portal_data(driver, day, day, target_ids)
+        received_ids = {row["id"] for row in rows}
+        print(f"Coverage: {len(received_ids)}/{len(target_ids)}; missing articles retain previous values", flush=True)
     except SystemExit:
         raise
     except Exception as exc:

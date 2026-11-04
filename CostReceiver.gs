@@ -14,6 +14,7 @@ function doPost(e) {
     request = JSON.parse(e.postData.contents);
   } catch (_) { return reply({ok:false,error:'Invalid JSON'}); }
   if (!secret || secret.length < 32 || request.token !== secret) return reply({ok:false,error:'Unauthorized'});
+  if (request.action === 'catalog') return wbReceiveCatalog_(request, reply, props);
   if (request.action === 'funnel') return wbReceiveFunnel_(request, reply, props);
   if (request.schema !== 1 || !Array.isArray(request.costs) || !request.costs.length || request.costs.length > 5000) {
     return reply({ok:false,error:'Invalid schema'});
@@ -163,4 +164,25 @@ function wbReceiveFunnel_(request, reply, props) {
   } catch (_) {
     return reply({ok:false,error:'Funnel write failed; inspect Apps Script execution log'});
   } finally { lock.releaseLock(); }
+}
+
+/** Read existing product IDs only; no caller-selected sheets or ranges. */
+function wbReceiveCatalog_(request, reply, props) {
+  if (request.schema !== 1) return reply({ok:false,error:'Invalid schema'});
+  const bookId = props.getProperty('WB_SPREADSHEET_ID');
+  if (!bookId) return reply({ok:false,error:'Run wbInstall first'});
+  const book = SpreadsheetApp.openById(bookId);
+  const ids = new Set();
+  ['Прогноз по конверсиям','Рабочая табличка'].forEach(name => {
+    const sheet = book.getSheetByName(name);
+    if (!sheet || sheet.getLastRow() < 2) return;
+    const headings = sheet.getRange(1,1,1,sheet.getLastColumn()).getDisplayValues()[0];
+    const column = headings.findIndex(h => h.trim() === 'Артикул WB');
+    if (column < 0) return;
+    sheet.getRange(2,column+1,sheet.getLastRow()-1,1).getDisplayValues().forEach(row => {
+      const id = String(row[0]).trim();
+      if (/^\d{1,16}$/.test(id)) ids.add(id);
+    });
+  });
+  return reply({ok:true,ids:Array.from(ids).slice(0,300),total:ids.size,limit:300});
 }
