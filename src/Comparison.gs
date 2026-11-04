@@ -1,4 +1,17 @@
 /** Comparison UI and queue. Included in the standalone receiver bundle. */
+function wbReceiverUpgrade_(releaseHash) {
+  const props=PropertiesService.getScriptProperties();
+  if(props.getProperty('WB_COMPARISON_STYLE_RELEASE')===releaseHash) return;
+  const lock=LockService.getScriptLock();
+  if(!lock.tryLock(1000)) return;
+  try {
+    if(props.getProperty('WB_COMPARISON_STYLE_RELEASE')!==releaseHash) {
+      wbColorComparisonColumns_();
+      props.setProperty('WB_COMPARISON_STYLE_RELEASE',releaseHash);
+    }
+  } finally {lock.releaseLock();}
+}
+
 function wbComparisonSheet_() {
   const props = PropertiesService.getScriptProperties();
   const bookId = props.getProperty('WB_SPREADSHEET_ID');

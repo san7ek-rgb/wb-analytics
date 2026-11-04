@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply verified WB code releases from the trusted repository
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /usr/local/lib/wb-autoupdate/auto_update.py
+UMask=0077
+TimeoutStartSec=5min

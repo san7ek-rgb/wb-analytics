@@ -311,6 +311,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--self-check" in sys.argv:
+        # No credentials, Firefox launch, network or spreadsheet writes.
+        print("WB collector imports OK", flush=True)
+        raise SystemExit(0)
     # Daily collection and minute polling share one persistent Firefox profile.
     lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".collector.lock")
     with open(lock_path, "a") as collector_lock:

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check WB code releases every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+AccuracySec=10s
+Unit=wb-auto-update.service
+
+[Install]
+WantedBy=timers.target
