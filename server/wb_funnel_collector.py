@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import websocket
 from datetime import date, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -114,10 +115,41 @@ def flatten_rows(root):
     return rows
 
 def get_portal_data(driver, start, end):
-    driver.get(PORTAL_URL)
-    time.sleep(8)
-    if "login" in driver.current_url.lower() or "auth" in driver.current_url.lower():
-        fail("WB session needs sign-in again. Open Firefox on the server and sign in.")
+    ws = websocket.create_connection(driver.capabilities["webSocketUrl"], timeout=45, suppress_origin=True)
+    captured_headers = None
+    try:
+        ws.send(json.dumps({"id": 1, "method": "session.subscribe",
+                            "params": {"events": ["network.beforeRequestSent"]}}))
+        ack = json.loads(ws.recv())
+        if ack.get("type") == "error":
+            fail("Firefox network subscription failed. Nothing was sent.")
+        driver.get(PORTAL_URL)
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            event = json.loads(ws.recv())
+            req = event.get("params", {}).get("request", {})
+            if req.get("method") != "POST" or req.get("url", "").split("?")[0] != DETAILS_URL:
+                continue
+            captured_headers = {}
+            for header in req.get("headers", []):
+                name = header["name"]
+                value = header["value"]
+                if isinstance(value, dict):
+                    value = value.get("value", "")
+                if not name.startswith(":") and name.lower() not in ("host", "content-length", "accept-encoding", "connection"):
+                    captured_headers[name] = value
+            if req.get("cookies"):
+                def cookie_value(c):
+                    v = c["value"]
+                    return v.get("value", "") if isinstance(v, dict) else v
+                captured_headers["Cookie"] = "; ".join(c["name"] + "=" + cookie_value(c) for c in req["cookies"])
+            break
+    except (websocket.WebSocketTimeoutException, KeyError):
+        fail("No live report request was captured. Open the report in the automation profile and verify sign-in.")
+    finally:
+        ws.close()
+    if not captured_headers:
+        fail("No live report request was captured. Nothing was sent.")
     result = []
     offset = 0
     for _ in range(1):
@@ -129,11 +161,8 @@ def get_portal_data(driver, start, end):
                            "end": (date.fromisoformat(end) - timedelta(days=1)).isoformat()},
             "orderBy": {"field": "orders", "mode": "desc"},
         }
-        cookie_header = "; ".join(c["name"] + "=" + c["value"] for c in driver.get_cookies()
-                                  if "wildberries.ru" in c.get("domain", ""))
-        headers = {"Content-Type": "application/json", "Cookie": cookie_header,
-                   "Origin": "https://seller.wildberries.ru", "Referer": PORTAL_URL,
-                   "User-Agent": driver.execute_script("return navigator.userAgent")}
+        headers = dict(captured_headers)
+        headers["Content-Type"] = "application/json"
         req = Request(DETAILS_URL, data=json.dumps(payload).encode(), headers=headers, method="POST")
         try:
             with urlopen(req, timeout=60) as remote:
@@ -184,6 +213,7 @@ def main():
     moscow_yesterday = datetime.now(ZoneInfo("Europe/Moscow")).date() - timedelta(days=1)
     day = moscow_yesterday.isoformat()
     options = Options()
+    options.set_capability("webSocketUrl", True)
     options.binary_location = "/usr/bin/firefox"
     options.add_argument("--headless")
     options.add_argument("--no-remote")
