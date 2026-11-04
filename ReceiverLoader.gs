@@ -28,6 +28,11 @@ function wbInstallComparison() {
   ScriptApp.getProjectTriggers();
   return wbReceiverRpc('wbInstallComparison');
 }
+function wbAuthorizeComparisonUi() {
+  // A static call is necessary: getUi() alone does not infer container.ui.
+  SpreadsheetApp.getUi().showSidebar(HtmlService.createHtmlOutput('Подключение панели сравнения…'));
+  return wbInstallComparison();
+}
 function wbComparisonOnOpen(e) { return wbReceiverRpc('wbComparisonOnOpen',e); }
 function wbOpenComparison() { return wbReceiverRpc('wbOpenComparison'); }
 function wbComparisonInit() { return wbReceiverRpc('wbComparisonInit'); }
