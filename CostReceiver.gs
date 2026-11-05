@@ -17,6 +17,7 @@ function doPost(e) {
   if (request.action === 'task' || request.action === 'jobError' || request.action === 'jobDefer') return wbComparisonTask_(request, reply, props);
   if (['historyProgress','historyError','historyDefer'].indexOf(request.action)>=0) return wbHistoryImportAction_(request,reply,props);
   if (request.action === 'historyStatus') return wbReceiveHistoryStatus_(request, reply, props);
+  if (request.action === 'photoApply') return wbPhotoApply_(request, reply, props);
   if (request.action === 'photoLayout') return wbPhotoLayout_(request, reply, props);
   if (request.action === 'catalog') return wbReceiveCatalog_(request, reply, props);
   if (request.action === 'funnel') return wbReceiveFunnel_(request, reply, props);
@@ -258,6 +259,34 @@ function wbPhotoLayout_(request,reply,props) {
   if(!sheet)return reply({ok:false,error:'Target sheet missing'});
   const range=sheet.getRange(1,1,Math.min(sheet.getLastRow(),30),Math.min(sheet.getLastColumn(),100));
   return reply({ok:true,name:sheet.getName(),values:range.getDisplayValues(),formulas:range.getFormulas(),merges:range.getMergedRanges().map(r=>r.getA1Notation())});
+}
+
+function wbPhotoApply_(request,reply,props) {
+  if(request.schema!==1)return reply({ok:false,error:'Invalid schema'});
+  const lock=LockService.getScriptLock();if(!lock.tryLock(1000))return reply({ok:false,error:'Busy'});
+  try {
+    const book=SpreadsheetApp.openById(props.getProperty('WB_SPREADSHEET_ID'));
+    const sheet=book.getSheets().find(s=>s.getSheetId()===1537466773);
+    if(!sheet||!String(sheet.getRange('C5').getValue()).includes('1899054708'))return reply({ok:false,error:'Product header moved; no change'});
+    const area=sheet.getRange('C4:D4'),marker='WB main photo 1899054708';
+    if(area.getNote()===marker)return reply({ok:true,alreadyApplied:true,formula:area.getCell(1,1).getFormula()});
+    if(area.getValues()[0].some(v=>v!=='')||area.getFormulas()[0].some(v=>v!==''))return reply({ok:false,error:'Photo cells occupied; no change'});
+    const token=props.getProperty('WB_API_TOKEN');
+    if(!token)return reply({ok:false,error:'WB content API token missing; no change'});
+    const response=UrlFetchApp.fetch('https://content-api.wildberries.ru/content/v2/get/cards/list',{
+      method:'post',contentType:'application/json',headers:{Authorization:token},muteHttpExceptions:true,
+      payload:JSON.stringify({settings:{cursor:{limit:100},filter:{textSearch:'1899054708',withPhoto:1}}})});
+    if(response.getResponseCode()!==200)return reply({ok:false,error:'WB content API HTTP '+response.getResponseCode()+'; no change'});
+    const data=JSON.parse(response.getContentText());
+    const card=(data.cards||[]).find(c=>String(c.nmID)==='1899054708');
+    const url=card&&card.photos&&card.photos[0]&&card.photos[0].big;
+    if(typeof url!=='string'||!/^https:\/\/[^/]+\.(?:wbasket|wbbasket|wbstatic)\.ru\//.test(url))return reply({ok:false,error:'Verified main photo unavailable; no change'});
+    const check=UrlFetchApp.fetch(url,{muteHttpExceptions:true});
+    if(check.getResponseCode()!==200||!/^image\//.test(String(check.getHeaders()['Content-Type']||check.getHeaders()['content-type']||'')))return reply({ok:false,error:'Photo download failed; no change'});
+    area.merge().setFormula('=IMAGE("'+url.replace(/"/g,'""')+'",1)').setNote(marker).setHorizontalAlignment('center').setVerticalAlignment('middle');
+    sheet.setRowHeight(4,220);SpreadsheetApp.flush();
+    return reply({ok:true,range:'C4:D4',header:sheet.getRange('C5').getDisplayValue(),formula:area.getCell(1,1).getFormula()});
+  } finally {lock.releaseLock();}
 }
 
 // GENERATED COMPARISON UI — edit src/Comparison.gs and src/ComparisonSidebar.html
