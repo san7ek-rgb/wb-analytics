@@ -17,6 +17,7 @@ function doPost(e) {
   if (request.action === 'task' || request.action === 'jobError' || request.action === 'jobDefer') return wbComparisonTask_(request, reply, props);
   if (['historyProgress','historyError','historyDefer'].indexOf(request.action)>=0) return wbHistoryImportAction_(request,reply,props);
   if (request.action === 'historyStatus') return wbReceiveHistoryStatus_(request, reply, props);
+  if (request.action === 'photosApply') return wbPhotosApply_(request, reply, props);
   if (request.action === 'photoApply') return wbPhotoApply_(request, reply, props);
   if (request.action === 'photoLayout') return wbPhotoLayout_(request, reply, props);
   if (request.action === 'catalog') return wbReceiveCatalog_(request, reply, props);
@@ -296,6 +297,44 @@ function wbPhotoApply_(request,reply,props) {
     area.merge().setFormula('=IMAGE("'+url.replace(/"/g,'""')+'")').setNote(marker).setHorizontalAlignment('center').setVerticalAlignment('middle');
     sheet.setRowHeight(4,220);SpreadsheetApp.flush();
     return reply({ok:true,range:'C4:D4',header:sheet.getRange('C5').getDisplayValue(),formula:area.getCell(1,1).getFormula()});
+  } finally {lock.releaseLock();}
+}
+
+function wbPhotosApply_(request,reply,props) {
+  if(request.schema!==1)return reply({ok:false,error:'Invalid schema'});
+  const lock=LockService.getScriptLock();if(!lock.tryLock(1000))return reply({ok:false,error:'Busy'});
+  try {
+    const book=SpreadsheetApp.openById(props.getProperty('WB_SPREADSHEET_ID'));
+    const sheet=book.getSheets().find(s=>s.getSheetId()===1537466773);
+    if(!sheet)return reply({ok:false,error:'Sheet missing'});
+    const headings=sheet.getRange(5,1,1,sheet.getLastColumn()).getDisplayValues()[0];
+    const token=props.getProperty('WB_API_TOKEN'),results=[];
+    if(!token)return reply({ok:false,error:'WB token missing'});
+    for(let c=2;c<headings.length;c++) {
+      const match=String(headings[c]).match(/\b(\d{6,16})\b/);if(!match)continue;
+      const id=match[1],cell=sheet.getRange(4,c+1),marker='WB main photo '+id;
+      const existing=sheet.getImages().find(i=>i.getAltTextDescription()===marker && i.getAnchorCell().getColumn()===c+1);
+      if(existing){results.push({id:id,status:'exists'});continue;}
+      if(cell.getValue()!=='' && cell.getNote()!==marker){results.push({id:id,status:'occupied'});continue;}
+      try {
+        const response=UrlFetchApp.fetch('https://content-api.wildberries.ru/content/v2/get/cards/list',{
+          method:'post',contentType:'application/json',headers:{Authorization:token},muteHttpExceptions:true,
+          payload:JSON.stringify({settings:{cursor:{limit:100},filter:{textSearch:id,withPhoto:1}}})});
+        if(response.getResponseCode()!==200){results.push({id:id,status:'WB HTTP '+response.getResponseCode()});continue;}
+        const card=(JSON.parse(response.getContentText()).cards||[]).find(item=>String(item.nmID)===id);
+        const url=card&&card.photos&&card.photos[0]&&card.photos[0].big;
+        if(typeof url!=='string'||!/^https:\/\/[^/]+\.(?:wbasket|wbbasket|wbstatic)\.ru\//.test(url)){results.push({id:id,status:'no photo'});continue;}
+        const photo=UrlFetchApp.fetch(url.replace(/\.webp$/,'.jpg'),{muteHttpExceptions:true});
+        if(photo.getResponseCode()!==200){results.push({id:id,status:'download failed'});continue;}
+        const image=sheet.insertImage(photo.getBlob(),c+1,4);
+        const width=sheet.getColumnWidth(c+1)+(c+2<=sheet.getMaxColumns()?sheet.getColumnWidth(c+2):0);
+        image.setAltTextDescription(marker).setWidth(Math.min(180,width-8)).setHeight(210);
+        if(cell.getNote()===marker)cell.clearContent();
+        cell.setNote(marker);results.push({id:id,status:'inserted'});
+      } catch(error){results.push({id:id,status:'error',error:String(error.message).slice(0,180)});}
+    }
+    sheet.setRowHeight(4,220);SpreadsheetApp.flush();
+    return reply({ok:results.every(r=>['exists','inserted'].includes(r.status)),results:results});
   } finally {lock.releaseLock();}
 }
 
