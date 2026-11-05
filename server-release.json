@@ -2,8 +2,8 @@
   "schema": 1,
   "files": {
     "wb_funnel_collector.py": {
-      "sha256": "229f616023303d5598dd99b466ca6c84f5df1f9a83fccfc2232f961407d7a0e2",
-      "size": 16133
+      "sha256": "0831d0699acf6fd3771d51450210d6b8484c89f10c059d60157612f62be4c47f",
+      "size": 15851
     },
     "wb-funnel.service": {
       "sha256": "a4805874fd48e0357310709d8d8ebd82c748652355cfe002e5ce1f87bdcf559c",
@@ -22,5 +22,5 @@
       "size": 175
     }
   },
-  "sha256": "54b5a46588ad39d7666da659977752e0acc5c71d2e611393debc8282808220aa"
+  "sha256": "947b1afc6e682195fbfeca3ab9168475e6ef3a1af6da260231ae5d2bb91a7d52"
 }

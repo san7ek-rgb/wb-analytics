@@ -1,0 +1,18 @@
+[Unit]
+Description=Run queued WB comparison from Google Sheets
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=reportdeploy
+Group=reportdeploy
+EnvironmentFile=/home/reportdeploy/wb-automation/.env
+ExecStart=/home/reportdeploy/wb-automation/venv/bin/python /home/reportdeploy/wb-automation/wb_funnel_collector.py --poll
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/reportdeploy/wb-automation /home/reportdeploy/.cache/selenium
+TimeoutStartSec=15min

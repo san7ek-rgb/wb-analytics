@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the waiting comparison worker
+
+[Timer]
+OnBootSec=3s
+OnUnitInactiveSec=3s
+AccuracySec=1s
+Unit=wb-comparison.service
+
+[Install]
+WantedBy=timers.target

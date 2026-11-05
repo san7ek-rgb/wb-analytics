@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Collect seller funnel metrics from the authenticated WB portal session."""
 import json
+import math
 import os
 import sys
 import time
@@ -32,90 +33,75 @@ def fail(message):
     print(message, file=sys.stderr, flush=True)
     raise SystemExit(message)
 
-def find_direct_id(obj):
-    if not isinstance(obj, dict):
-        return None
-    keys = ("nmId", "nmID", "nm_id", "nmid", "articleId", "vendorCode")
-    for key in keys:
-        value = obj.get(key)
-        if isinstance(value, (str, int)) and str(value).isdigit() and 1 <= len(str(value)) <= 16:
-            return str(value)
-    for key in ("product", "card", "nm", "item"):
-        nested = obj.get(key)
-        if isinstance(nested, dict):
-            result = find_direct_id(nested)
-            if result:
-                return result
+def report_number(item, names, integer=False):
+    # Read product-level current values ONLY. Chart points and WB Club/b2b
+    # subtotals must never replace the corresponding whole-product counters.
+    for name in names:
+        if name not in item:
+            continue
+        value = item[name]
+        if isinstance(value, dict):
+            value = value.get("current")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(value) or value < 0:
+            continue
+        if integer and int(value) != value:
+            continue
+        return int(value) if integer else float(value)
     return None
 
-def find_metric(obj, names):
-    wanted = {name.lower() for name in names}
-    stack = [obj]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key.lower() in wanted and isinstance(child, (int, float)) and not isinstance(child, bool):
-                    return float(child)
-                if key.lower() in wanted and isinstance(child, dict):
-                    current = child.get("current")
-                    if isinstance(current, (int, float)) and not isinstance(current, bool):
-                        return float(current)
-                if isinstance(child, (dict, list)):
-                    stack.append(child)
-        elif isinstance(value, list):
-            stack.extend(value)
-    return None
 
 def flatten_rows(root):
-    found = {}
-    stack = [root]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, list):
-            stack.extend(reversed(item))
+    data = root.get("data") if isinstance(root, dict) else None
+    if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
+        fail("Unexpected report structure: product groups missing. Nothing was sent.")
+    found, conflicts = {}, set()
+    skipped, missing_names = 0, set()
+    for group in data["groups"]:
+        if not isinstance(group, dict):
             continue
-        if not isinstance(item, dict):
-            continue
-        product_id = find_direct_id(item)
-        has_child_array = any(isinstance(v, list) for v in item.values())
-        if product_id and not has_child_array:
-            metrics = {
-                "impressions": find_metric(item, ("viewCount", "views", "impressions", "impressionCount", "showCount")),
-                "ctr": find_metric(item, ("viewToOpenConversion", "ctr", "ctrPercent", "clickThroughRate")),
-                "clicks": find_metric(item, ("openCard", "openCardCount", "openCount", "clicks", "clickCount")),
-                "carts": find_metric(item, ("addToCart", "addToCartCount", "cartCount", "addToCartCountAll")),
-                "orders": find_metric(item, ("orderCount", "ordersCount", "orders")),
-                "buyouts": find_metric(item, ("buyoutCount", "buyoutsCount", "buyouts")),
-                "revenue": find_metric(item, ("buyoutSum",)),
+        items = group.get("itemsGroup", [])
+        if not isinstance(items, list):
+            fail("Unexpected product list structure. Nothing was sent.")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_id = item.get("nmId")
+            product_id = str(raw_id) if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) else ""
+            if not product_id.isdigit() or not 1 <= len(product_id) <= 16:
+                skipped += 1
+                continue
+            counts = {
+                "impressions": report_number(item, ("viewCount", "impressions"), True),
+                "clicks": report_number(item, ("openCard", "openCardCount", "openCount"), True),
+                "carts": report_number(item, ("addToCart", "addToCartCount", "cartCount"), True),
+                "orders": report_number(item, ("orders", "orderCount", "ordersCount"), True),
+                "buyouts": report_number(item, ("buyoutCount", "buyoutsCount"), True),
             }
-            if metrics["impressions"] is not None:
-                found[product_id] = metrics
-        for value in item.values():
-            if isinstance(value, (dict, list)):
-                stack.append(value)
-    rows = []
-    for product_id, m in found.items():
-        impressions = int(m["impressions"] or 0)
-        clicks = int(m["clicks"] or 0)
-        if any(m[k] is None for k in ("clicks", "carts", "orders", "buyouts")):
-            fail("A product is missing required funnel fields; nothing was sent.")
-        ctr = clicks / impressions if impressions else 0
-        if ctr is None:
-            ctr = clicks / impressions if impressions else 0
-        elif ctr > 1:
-            ctr /= 100
-        rows.append({
-            "id": product_id,
-            "impressions": impressions,
-            "ctr": min(max(float(ctr), 0), 1),
-            "clicks": clicks,
-            "carts": int(m["carts"] or 0),
-            "orders": int(m["orders"] or 0),
-            "buyouts": int(m["buyouts"] or 0),
-            "revenue": m["revenue"],
-        })
-    return rows
+            missing = [key for key, value in counts.items() if value is None]
+            if missing:
+                skipped += 1
+                missing_names.update(missing)
+                continue
+            impressions, clicks = counts["impressions"], counts["clicks"]
+            if clicks > impressions:
+                skipped += 1
+                missing_names.add("comparable impressions/clicks")
+                continue
+            row = {"id": product_id, **counts,
+                   "ctr": clicks / impressions if impressions else 0,
+                   "revenue": report_number(item, ("buyoutSum",))}
+            if product_id in found and found[product_id] != row:
+                conflicts.add(product_id)
+            else:
+                found[product_id] = row
+    for product_id in conflicts:
+        found.pop(product_id, None)
+    if skipped or conflicts:
+        print(f"Excluded incomplete/conflicting report rows: {skipped + len(conflicts)}; unavailable fields: {', '.join(sorted(missing_names)) or 'conflicting duplicates'}. Previous sheet values retained.", flush=True)
+    return list(found.values())
+
 
 def get_portal_data(driver, start, end, target_ids):
     ws = websocket.create_connection(driver.capabilities["webSocketUrl"], timeout=45, suppress_origin=True)
@@ -196,7 +182,7 @@ def get_portal_data(driver, start, end, target_ids):
         if batch_start + 25 < len(target_ids):
             time.sleep(3)
     if not result:
-        fail("No product rows with impressions found in WB response. Nothing was sent.")
+        fail("No complete product rows with comparable impressions and funnel counters for this period. Nothing was sent.")
     dedup = {row["id"]: row for row in result}
     return list(dedup.values())
 
