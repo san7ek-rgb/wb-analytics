@@ -16,6 +16,9 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/reportdeploy/wb-automation /home/reportdeploy/.cache/selenium
 TimeoutStartSec=15min
+Restart=no
+RestartForceExitStatus=75
+RestartSec=15s
 
 [Install]
 WantedBy=multi-user.target

@@ -7,6 +7,7 @@ function wbReceiverUpgrade_(releaseHash) {
   try {
     if(props.getProperty('WB_COMPARISON_STYLE_RELEASE')!==releaseHash) {
       wbColorComparisonColumns_();
+      wbEnsureHistoryImport_(props);
       props.setProperty('WB_COMPARISON_STYLE_RELEASE',releaseHash);
     }
   } finally {lock.releaseLock();}
@@ -179,7 +180,7 @@ function wbComparisonInit() {
   const today = Utilities.formatDate(new Date(),'Europe/Moscow','yyyy-MM-dd');
   const yesterday = new Date(today+'T12:00:00Z'); yesterday.setUTCDate(yesterday.getUTCDate()-1);
   return {products:products,historyStart:props.getProperty('WB_HISTORY_START') || '',
-    yesterday:yesterday.toISOString().slice(0,10),job:wbComparisonStatus()};
+    yesterday:yesterday.toISOString().slice(0,10),history:wbHistoryStatus(),job:wbComparisonStatus()};
 }
 
 function wbComparisonDate_(s) {
@@ -210,7 +211,7 @@ function wbQueueComparison(config) {
     const metrics = ['conversionScore','orders10000','buyouts10000','revenue10000','profitUnit','margin'];
     if (metrics.indexOf(config.metric) < 0) throw new Error('Неизвестный показатель сравнения.');
     const job = {id:Utilities.getUuid(),status:'queued',ids:ids,start:start,end:end,metric:config.metric,
-      includeAds:config.includeAds === true,mode:config.mode==='all'?'all':'dates',created:new Date().toISOString(),message:'Команда принята. Сервер начинает загрузку после получения сигнала.'};
+      includeAds:config.includeAds === true,source:config.historyOnly?'history':'wb',mode:config.mode==='all'?'all':'dates',created:new Date().toISOString(),message:'Команда принята. Сервер начинает загрузку после получения сигнала.'};
     if (wbComparisonDate_(config.historyStart)) props.setProperty('WB_HISTORY_START',config.historyStart);
     // Only the existing comparison checkboxes are synchronized; formulas are preserved.
     const formulas = sheet.getRange(2,22,rows.length,1).getFormulas();
@@ -250,7 +251,9 @@ function wbComparisonTask_(request, reply, props) {
   // frequent properties reads and lets a new command wake the worker promptly.
   if (request.action==='task' && Number.isInteger(request.waitSeconds) && request.waitSeconds>0) {
     const peek=JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
-    if (!peek || ['queued','running'].indexOf(peek.status)<0) {
+    const history=request.historyWorker===1?JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB') || 'null'):null;
+    const historyReady=history && ['queued','running'].indexOf(history.status)>=0 && (!history.notBefore || history.notBefore<=Date.now());
+    if ((!peek || ['queued','running'].indexOf(peek.status)<0) && !historyReady) {
       const deadline=Date.now()+Math.min(request.waitSeconds,20)*1000;
       while(Date.now()<deadline) {
         try {if(CacheService.getScriptCache().get('wb-comparison-pending')) break;} catch (_) {break;}
@@ -261,7 +264,12 @@ function wbComparisonTask_(request, reply, props) {
   const lock = LockService.getScriptLock(); if (!lock.tryLock(1000)) return reply({ok:false,error:'Busy'});
   try {
     const job = JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
-    if (!job || ['queued','running'].indexOf(job.status)<0) {wbComparisonClearWake_();return reply({ok:true,job:null});}
+    if (!job || ['queued','running'].indexOf(job.status)<0) {
+      if(request.action==='task' && request.historyWorker===1) {
+        const history=wbClaimHistoryImport_(props);if(history)return reply({ok:true,job:history});
+      }
+      wbComparisonClearWake_();return reply({ok:true,job:null});
+    }
     if (request.action==='jobDefer') {
       if(request.jobId!==job.id) return reply({ok:false,error:'Job mismatch'});
       job.status='queued';job.attempts=Math.max(0,Number(job.attempts||0)-1);
@@ -324,4 +332,101 @@ function wbComparisonStatus() {
   results.sort((a,b)=>(b.conversionScore===null?-Infinity:b.conversionScore)-(a.conversionScore===null?-Infinity:a.conversionScore));
   job.metric='conversionScore';job.results=results;job.missing=job.ids.filter(id=>!facts.some(r=>r.id===id));
   return job;
+}
+
+function wbHistoryStatus() {
+  const props=PropertiesService.getScriptProperties();
+  const summary=JSON.parse(props.getProperty('WB_HISTORY_STATUS') || 'null');
+  const job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB') || 'null');
+  return summary?Object.assign(summary,{importJob:job}):{dailyRows:0,days:0,articles:0,periodRows:0,importJob:job,unconfirmed:true};
+}
+
+function wbCreateHistoryImport_(props,start,end) {
+  if(!wbComparisonDate_(start)||!wbComparisonDate_(end)||start>end)throw new Error('Укажите корректные даты истории.');
+  const total=Math.round((Date.parse(end+'T12:00:00Z')-Date.parse(start+'T12:00:00Z'))/86400000)+1;
+  const today=Utilities.formatDate(new Date(),'Europe/Moscow','yyyy-MM-dd');
+  if(total>5000||end>=today)throw new Error('История загружается только за завершённые дни, до 5000 дней за задание.');
+  const catalog=wbReceiveCatalog_({schema:1},v=>v,props);
+  if(!catalog.ok||!catalog.ids.length)throw new Error('Не найдены артикулы для истории.');
+  const job={id:Utilities.getUuid(),kind:'history',status:'queued',ids:catalog.ids,start:start,end:end,cursor:start,
+    processedDays:0,totalDays:total,unavailableStreak:0,attempts:0,created:new Date().toISOString(),
+    message:'Дневная история поставлена в очередь с '+start+' по '+end+'.'};
+  props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));wbComparisonWake_(job.id);return job;
+}
+
+function wbEnsureHistoryImport_(props) {
+  if(props.getProperty('WB_HISTORY_IMPORT_INITIALIZED'))return;
+  if(!props.getProperty('WB_HISTORY_IMPORT_JOB')) {
+    const today=Utilities.formatDate(new Date(),'Europe/Moscow','yyyy-MM-dd');
+    const end=new Date(today+'T12:00:00Z');end.setUTCDate(end.getUTCDate()-1);
+    // Initial date explicitly requested by the user; never inferred as a WB limit.
+    wbCreateHistoryImport_(props,'2025-05-01',end.toISOString().slice(0,10));
+  }
+  props.setProperty('WB_HISTORY_IMPORT_INITIALIZED','1');
+}
+
+function wbStartHistoryImport(config) {
+  const lock=LockService.getScriptLock();lock.waitLock(10000);
+  try {
+    const props=PropertiesService.getScriptProperties(),old=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(old && ['queued','running'].indexOf(old.status)>=0)throw new Error('Импорт уже идёт. Сначала приостановите его.');
+    const job=wbCreateHistoryImport_(props,config.start,config.end);
+    props.setProperty('WB_HISTORY_IMPORT_INITIALIZED','1');return job;
+  } finally {lock.releaseLock();}
+}
+
+function wbPauseHistoryImport() {
+  const lock=LockService.getScriptLock();lock.waitLock(10000);
+  try {
+    const props=PropertiesService.getScriptProperties(),job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(job && ['queued','running'].indexOf(job.status)>=0){job.status='paused';job.message='Импорт приостановлен. Сохранённые дни остаются в базе.';props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));}
+    return job;
+  } finally {lock.releaseLock();}
+}
+
+function wbResumeHistoryImport() {
+  const lock=LockService.getScriptLock();lock.waitLock(10000);
+  try {
+    const props=PropertiesService.getScriptProperties(),job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(job && ['paused','error'].indexOf(job.status)>=0){job.status='queued';job.attempts=0;job.notBefore=0;job.message='Продолжение с '+job.cursor;props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));wbComparisonWake_(job.id);}
+    return job;
+  } finally {lock.releaseLock();}
+}
+
+function wbClaimHistoryImport_(props) {
+  const job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+  if(!job||['queued','running'].indexOf(job.status)<0||(job.notBefore&&job.notBefore>Date.now()))return null;
+  job.attempts=Number(job.attempts||0)+1;
+  if(job.attempts>3){job.status='error';job.message='Три прерывания импорта. Можно продолжить с '+job.cursor;props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));return null;}
+  job.status='running';job.message='Загружается дневная история с '+job.cursor;
+  props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));return job;
+}
+
+function wbHistoryImportAction_(request,reply,props) {
+  const lock=LockService.getScriptLock();if(!lock.tryLock(1000))return reply({ok:false,error:'Busy'});
+  try {
+    const job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(request.schema!==1||!job||request.jobId!==job.id)return reply({ok:false,error:'History job mismatch'});
+    if(['queued','running'].indexOf(job.status)<0)return reply({ok:true,continue:false});
+    if(request.action==='historyError') {
+      job.status='error';job.message='Импорт остановлен на '+job.cursor+'. '+String(request.message||'Проверьте журнал сервера.').slice(0,180);
+    } else if(request.action==='historyDefer') {
+      job.status='queued';job.attempts=Math.max(0,Number(job.attempts||0)-1);job.message='Ожидается свободный профиль WB.';
+    } else {
+      const last=new Date(job.end+'T12:00:00Z');last.setUTCDate(last.getUTCDate()+1);const after=last.toISOString().slice(0,10);
+      if(!wbComparisonDate_(request.cursor)||request.cursor<job.cursor||request.cursor>after)return reply({ok:false,error:'Invalid history cursor'});
+      job.cursor=request.cursor;job.processedDays=Math.round((Date.parse(job.cursor+'T12:00:00Z')-Date.parse(job.start+'T12:00:00Z'))/86400000);
+      job.attempts=0;job.unavailableStreak=Number.isInteger(request.unavailableStreak)?Math.min(100,Math.max(0,request.unavailableStreak)):0;
+      job.notBefore=Date.now()+Math.min(86400,Math.max(0,Number(request.delaySeconds)||0))*1000;
+      job.lastRetryDelay=request.retryDelay?Math.min(86400,Math.max(0,Number(request.retryDelay)||0)):0;
+      job.status=job.cursor>job.end?'completed':request.yield?'queued':'running';
+      job.message=job.status==='completed'?'Обход истории завершён. Недоступные и неполные дни отмечены отдельно.':
+        'Обработано '+job.processedDays+' из '+job.totalDays+' дней. Следующая дата: '+job.cursor+(request.delaySeconds?' (пауза перед продолжением)':'');
+    }
+    props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));
+    if(request.summary)wbReceiveHistoryStatus_({schema:1,summary:request.summary},v=>v,props);
+    if(job.status==='queued')wbComparisonWake_(job.id);
+    const compare=JSON.parse(props.getProperty('WB_COMPARISON_JOB')||'null');
+    return reply({ok:true,continue:['queued','running'].indexOf(job.status)>=0,comparisonWaiting:compare&&['queued','running'].indexOf(compare.status)>=0});
+  } finally {lock.releaseLock();}
 }

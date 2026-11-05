@@ -15,6 +15,8 @@ function doPost(e) {
   } catch (_) { return reply({ok:false,error:'Invalid JSON'}); }
   if (!secret || secret.length < 32 || request.token !== secret) return reply({ok:false,error:'Unauthorized'});
   if (request.action === 'task' || request.action === 'jobError' || request.action === 'jobDefer') return wbComparisonTask_(request, reply, props);
+  if (['historyProgress','historyError','historyDefer'].indexOf(request.action)>=0) return wbHistoryImportAction_(request,reply,props);
+  if (request.action === 'historyStatus') return wbReceiveHistoryStatus_(request, reply, props);
   if (request.action === 'catalog') return wbReceiveCatalog_(request, reply, props);
   if (request.action === 'funnel') return wbReceiveFunnel_(request, reply, props);
   if (request.schema !== 1 || !Array.isArray(request.costs) || !request.costs.length || request.costs.length > 5000) {
@@ -200,22 +202,52 @@ function wbReceiveFunnel_(request, reply, props) {
 /** Read existing product IDs only; no caller-selected sheets or ranges. */
 function wbReceiveCatalog_(request, reply, props) {
   if (request.schema !== 1) return reply({ok:false,error:'Invalid schema'});
-  const bookId = props.getProperty('WB_SPREADSHEET_ID');
-  if (!bookId) return reply({ok:false,error:'Run wbInstall first'});
-  const book = SpreadsheetApp.openById(bookId);
-  const ids = new Set();
-  ['Прогноз по конверсиям','Рабочая табличка'].forEach(name => {
-    const sheet = book.getSheetByName(name);
-    if (!sheet || sheet.getLastRow() < 2) return;
-    const headings = sheet.getRange(1,1,1,sheet.getLastColumn()).getDisplayValues()[0];
-    const column = headings.findIndex(h => h.trim() === 'Артикул WB');
-    if (column < 0) return;
-    sheet.getRange(2,column+1,sheet.getLastRow()-1,1).getDisplayValues().forEach(row => {
-      const id = String(row[0]).trim();
-      if (/^\d{1,16}$/.test(id)) ids.add(id);
+  const bookId=props.getProperty('WB_SPREADSHEET_ID');
+  if(!bookId) return reply({ok:false,error:'Run wbInstall first'});
+  const book=SpreadsheetApp.openById(bookId),ids=new Set(),products=new Map();
+  ['Прогноз по конверсиям','Рабочая табличка'].forEach(name=>{
+    const sheet=book.getSheetByName(name);
+    if(!sheet || sheet.getLastRow()<2) return;
+    const headings=sheet.getRange(1,1,1,sheet.getLastColumn()).getDisplayValues()[0].map(h=>h.trim());
+    const column=headings.indexOf('Артикул WB');if(column<0)return;
+    const title=headings.indexOf('Товар'),type=headings.indexOf('Тип товара');
+    const cost=headings.indexOf('Себестоимость за единицу, ₽ (ввод)');
+    sheet.getRange(2,1,sheet.getLastRow()-1,headings.length).getValues().forEach(row=>{
+      const id=String(row[column]).trim();if(!/^\d{1,16}$/.test(id))return;ids.add(id);
+      if(!products.has(id)) {
+        const product={id:id,name:title>=0?String(row[title]||''):'',type:type>=0?String(row[type]||''):''};
+        if(cost>=0 && typeof row[cost]==='number' && Number.isFinite(row[cost]) && row[cost]>=0)product.cost=row[cost];
+        products.set(id,product);
+      }
     });
   });
-  return reply({ok:true,ids:Array.from(ids).slice(0,300),total:ids.size,limit:300});
+  const selected=Array.from(ids).slice(0,300);
+  return reply({ok:true,ids:selected,products:selected.map(id=>products.get(id)),total:ids.size,limit:300});
+}
+
+function wbReceiveHistoryStatus_(request,reply,props) {
+  if(request.schema!==1 || !request.summary || typeof request.summary!=='object')return reply({ok:false,error:'Invalid history summary'});
+  const summary={};
+  for(const key of ['dailyRows','days','articles','periodRows','missingRows','unavailableDays']) {
+    const value=request.summary[key]===undefined?0:request.summary[key];
+    if(!Number.isSafeInteger(value)||value<0||value>100000000)return reply({ok:false,error:'Invalid history count'});
+    summary[key]=value;
+  }
+  for(const key of ['firstDay','lastDay']) {
+    const value=request.summary[key]||'';
+    if(value!=='' && !wbComparisonDate_(value))return reply({ok:false,error:'Invalid history date'});
+    summary[key]=value;
+  }
+  for(const key of ['updatedAt','backupAt']) {
+    const value=request.summary[key]||'';
+    if(typeof value!=='string'||value.length>64||(value!==''&&!Number.isFinite(Date.parse(value))))return reply({ok:false,error:'Invalid history timestamp'});
+    summary[key]=value;
+  }
+  summary.error=typeof request.summary.error==='string'?request.summary.error.slice(0,250):'';
+  const previous=JSON.parse(props.getProperty('WB_HISTORY_STATUS')||'null');
+  if(previous && previous.updatedAt && summary.updatedAt && Date.parse(summary.updatedAt)<Date.parse(previous.updatedAt))return reply({ok:true,ignored:true});
+  props.setProperty('WB_HISTORY_STATUS',JSON.stringify(summary));
+  return reply({ok:true});
 }
 
 // GENERATED COMPARISON UI — edit src/Comparison.gs and src/ComparisonSidebar.html
@@ -228,6 +260,7 @@ function wbReceiverUpgrade_(releaseHash) {
   try {
     if(props.getProperty('WB_COMPARISON_STYLE_RELEASE')!==releaseHash) {
       wbColorComparisonColumns_();
+      wbEnsureHistoryImport_(props);
       props.setProperty('WB_COMPARISON_STYLE_RELEASE',releaseHash);
     }
   } finally {lock.releaseLock();}
@@ -400,7 +433,7 @@ function wbComparisonInit() {
   const today = Utilities.formatDate(new Date(),'Europe/Moscow','yyyy-MM-dd');
   const yesterday = new Date(today+'T12:00:00Z'); yesterday.setUTCDate(yesterday.getUTCDate()-1);
   return {products:products,historyStart:props.getProperty('WB_HISTORY_START') || '',
-    yesterday:yesterday.toISOString().slice(0,10),job:wbComparisonStatus()};
+    yesterday:yesterday.toISOString().slice(0,10),history:wbHistoryStatus(),job:wbComparisonStatus()};
 }
 
 function wbComparisonDate_(s) {
@@ -431,7 +464,7 @@ function wbQueueComparison(config) {
     const metrics = ['conversionScore','orders10000','buyouts10000','revenue10000','profitUnit','margin'];
     if (metrics.indexOf(config.metric) < 0) throw new Error('Неизвестный показатель сравнения.');
     const job = {id:Utilities.getUuid(),status:'queued',ids:ids,start:start,end:end,metric:config.metric,
-      includeAds:config.includeAds === true,mode:config.mode==='all'?'all':'dates',created:new Date().toISOString(),message:'Команда принята. Сервер начинает загрузку после получения сигнала.'};
+      includeAds:config.includeAds === true,source:config.historyOnly?'history':'wb',mode:config.mode==='all'?'all':'dates',created:new Date().toISOString(),message:'Команда принята. Сервер начинает загрузку после получения сигнала.'};
     if (wbComparisonDate_(config.historyStart)) props.setProperty('WB_HISTORY_START',config.historyStart);
     // Only the existing comparison checkboxes are synchronized; formulas are preserved.
     const formulas = sheet.getRange(2,22,rows.length,1).getFormulas();
@@ -471,7 +504,9 @@ function wbComparisonTask_(request, reply, props) {
   // frequent properties reads and lets a new command wake the worker promptly.
   if (request.action==='task' && Number.isInteger(request.waitSeconds) && request.waitSeconds>0) {
     const peek=JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
-    if (!peek || ['queued','running'].indexOf(peek.status)<0) {
+    const history=request.historyWorker===1?JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB') || 'null'):null;
+    const historyReady=history && ['queued','running'].indexOf(history.status)>=0 && (!history.notBefore || history.notBefore<=Date.now());
+    if ((!peek || ['queued','running'].indexOf(peek.status)<0) && !historyReady) {
       const deadline=Date.now()+Math.min(request.waitSeconds,20)*1000;
       while(Date.now()<deadline) {
         try {if(CacheService.getScriptCache().get('wb-comparison-pending')) break;} catch (_) {break;}
@@ -482,7 +517,12 @@ function wbComparisonTask_(request, reply, props) {
   const lock = LockService.getScriptLock(); if (!lock.tryLock(1000)) return reply({ok:false,error:'Busy'});
   try {
     const job = JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
-    if (!job || ['queued','running'].indexOf(job.status)<0) {wbComparisonClearWake_();return reply({ok:true,job:null});}
+    if (!job || ['queued','running'].indexOf(job.status)<0) {
+      if(request.action==='task' && request.historyWorker===1) {
+        const history=wbClaimHistoryImport_(props);if(history)return reply({ok:true,job:history});
+      }
+      wbComparisonClearWake_();return reply({ok:true,job:null});
+    }
     if (request.action==='jobDefer') {
       if(request.jobId!==job.id) return reply({ok:false,error:'Job mismatch'});
       job.status='queued';job.attempts=Math.max(0,Number(job.attempts||0)-1);
@@ -547,5 +587,102 @@ function wbComparisonStatus() {
   return job;
 }
 
-const WB_COMPARISON_HTML = "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><style>\n[hidden]{display:none!important}body{font:13px Arial,sans-serif;background:#e5edf4;color:#21394e;margin:12px}h3{margin:14px 0 8px}input,select,button{box-sizing:border-box;font:inherit;border:1px solid #91a8bb;border-radius:6px;padding:8px;background:#d8e5ef;color:#17364e;width:100%;margin:4px 0}button{cursor:pointer;background:#285b7c;color:#fff;font-weight:bold}button:disabled{opacity:.5;cursor:wait}.muted{font-size:11px;line-height:1.5;color:#486074}.products{max-height:200px;overflow:auto;border:1px solid #91a8bb;border-radius:6px}.product{display:block;padding:7px;border-bottom:1px solid #bbccd9}.product:nth-child(even){background:#d5e2ed}input[type=checkbox]{width:auto;margin-right:6px}.row{display:flex;gap:6px}.status{padding:9px;background:#cfdeeb;white-space:pre-wrap;border-radius:6px;margin-top:10px}.card{padding:10px;margin:8px 0;border-radius:6px}.green{background:#c6e1cf}.yellow{background:#eee1b7}.red{background:#edc9c7}.none{background:#cbd6df}.error{background:#edc9c7}.secondary{background:#59768d}label{display:block;margin-top:7px}.value{font-size:18px;font-weight:bold;margin:6px 0}\n</style></head><body>\n<p class=\"muted\">Цвета столбцов: песочный — ручной ввод (M, N); голубой — автоматические данные и расчёты; мятный — выбор товаров.</p><h3>Артикулы для сравнения</h3><input id=\"search\" placeholder=\"Поиск по артикулу, товару, типу\"><div class=\"row\"><button class=\"secondary\" id=\"selectVisible\">Выбрать найденные</button><button class=\"secondary\" id=\"clear\">Снять всё</button></div><div id=\"count\"></div><div class=\"products\" id=\"products\"></div>\n<h3>Период</h3><select id=\"mode\"><option value=\"dates\">Любые даты</option><option value=\"all\">С начала работы магазина</option></select>\n<label id=\"historyLabel\">Дата начала работы магазина<input type=\"date\" id=\"historyStart\"></label>\n<label id=\"startLabel\">С даты<input type=\"date\" id=\"start\"></label><label>По дату включительно<input type=\"date\" id=\"end\"></label>\n<p class=\"muted\">Можно выбрать прошлый год. Сегодня — неполный день. Доступность истории зависит от WB: при отказе период не подменяется. Дата начала магазина задаётся вами — автоматически она пока не определена.</p>\n<h3>ABC по конверсиям</h3><select id=\"metric\"><option value=\"conversionScore\">Четыре конверсии — равный вес</option></select>\n<input type=\"checkbox\" id=\"includeAds\" hidden>\n<p class=\"muted\">CTR, переход → корзина, корзина → заказ, заказ → выкуп: каждую конверсию делим на среднюю среди выбранных сопоставимых товаров и усредняем с равным весом. A — выше, B — средние, C — ниже. W — категория, X — отклонение индекса от среднего. Финансы в ABC не входят. Это относительная оценка, не статистический A/B-тест.</p>\n<label>Показать оценки<select id=\"gradeFilter\"><option value=\"all\">Все</option><option value=\"green\">A — выше</option><option value=\"yellow\">B — средние</option><option value=\"red\">C — ниже</option><option value=\"none\">Нет данных</option></select></label><button id=\"compare\" disabled>Сравнить</button><button id=\"cancel\" class=\"secondary\" hidden>Отменить ожидание</button><div class=\"status\" id=\"status\">Загрузка…</div><div id=\"results\"></div>\n<script>\nconst $=id=>document.getElementById(id);let products=[],selected=new Set(),currentJob=null,poller=null;\nconst names={conversionScore:'Индекс конверсий (среднее 100)'};\nfunction text(el,value){el.textContent=value;return el;}\nfunction error(e){$('status').className='status error';$('status').textContent=e.message||String(e);$('compare').disabled=false;}\nfunction visible(){const q=$('search').value.trim().toLocaleLowerCase();return products.filter(p=>(p.id+' '+p.name+' '+p.type).toLocaleLowerCase().includes(q));}\nfunction renderProducts(){const root=$('products');root.textContent='';visible().forEach(p=>{const label=document.createElement('label');label.className='product';const box=document.createElement('input');box.type='checkbox';box.checked=selected.has(p.id);box.onchange=()=>{box.checked?selected.add(p.id):selected.delete(p.id);$('count').textContent='Выбрано: '+selected.size+' / 300';};label.append(box,document.createTextNode(p.id+' · '+p.name));root.appendChild(label);});$('count').textContent='Выбрано: '+selected.size+' / 300';}\nfunction mode(){const all=$('mode').value==='all';$('historyLabel').hidden=!all;$('startLabel').hidden=all;}\nfunction fmt(v,percent=false){return v===null||v===undefined?'нет данных':(percent?v*100:v).toLocaleString('ru-RU',{maximumFractionDigits:2})+(percent?'%':'');}\nfunction showJob(job){currentJob=job;const active=job&&['queued','running'].includes(job.status);$('compare').disabled=!!active;$('cancel').hidden=!active;$('status').className='status'+(job&&job.status==='error'?' error':'');$('status').textContent=job?job.message:'Выберите товары и период.';if(poller){clearTimeout(poller);poller=null;}if(active)poller=setTimeout(refresh,1000);$('results').textContent='';if(!job||job.status!=='completed')return;\n text($('status'),job.start+' — '+job.end+'\\nПолучено '+job.results.length+' из '+job.ids.length+' товаров. '+(job.missing.length?'Нет полных сопоставимых данных WB: '+job.missing.join(', '):''));\n const legend=document.createElement('p');legend.className='muted';legend.textContent='ABC сравнивает только конверсии среди выбранных карточек. Для оценки нужны хотя бы две карточки с полной сопоставимой воронкой. Равные значения получают одинаковую категорию; серый — недостаточно данных.';$('results').appendChild(legend);\n job.results.filter(r=>$('gradeFilter').value==='all'||r.grade===$('gradeFilter').value).forEach(r=>{const card=document.createElement('div');card.className='card '+r.grade;const title=document.createElement('strong');title.textContent=(r.abc==='Нет данных'?'Нет данных':'ABC '+r.abc)+': '+r.id+' · '+r.name;const value=document.createElement('div');value.className='value';value.textContent=names[job.metric]+': '+fmt(r[job.metric],job.metric==='margin');const details=document.createElement('div');details.textContent='От среднего: '+(r.difference===null?'нет данных':(r.difference>0?'+':'')+fmt(r.difference,true))+'\\nCTR: '+fmt(r.ctr,true)+'\\nПереход → корзина: '+fmt(r.cartRate,true)+'\\nКорзина → заказ: '+fmt(r.orderRate,true)+'\\nЗаказ → выкуп: '+fmt(r.buyoutRate,true)+'\\nПоказы: '+fmt(r.impressions)+' · Заказы: '+fmt(r.orders)+' · Выкупы: '+fmt(r.buyouts);details.style.whiteSpace='pre-wrap';card.append(title,value,details);$('results').appendChild(card);});}\nfunction refresh(){google.script.run.withSuccessHandler(showJob).withFailureHandler(error).wbComparisonStatus();}\n$('gradeFilter').onchange=()=>{if(currentJob)showJob(currentJob);};\n$('search').oninput=renderProducts;$('mode').onchange=mode;$('selectVisible').onclick=()=>{visible().forEach(p=>{if(selected.size<300)selected.add(p.id);});renderProducts();};$('clear').onclick=()=>{selected.clear();renderProducts();};\n$('compare').onclick=()=>{if(selected.size<2||selected.size>300){error({message:'Выберите от 2 до 300 товаров.'});return;}$('compare').disabled=true;$('status').className='status';$('status').textContent='Отправляем команду на сравнение…';$('results').textContent='';google.script.run.withSuccessHandler(showJob).withFailureHandler(error).wbQueueComparison({ids:Array.from(selected),mode:$('mode').value,start:$('start').value,end:$('end').value,historyStart:$('historyStart').value,metric:$('metric').value,includeAds:$('includeAds').checked});};\n$('cancel').onclick=()=>google.script.run.withSuccessHandler(showJob).withFailureHandler(error).wbCancelComparison();\ngoogle.script.run.withSuccessHandler(data=>{products=data.products;selected=new Set(products.filter(p=>p.selected).map(p=>p.id));$('historyStart').value=data.historyStart;$('start').value=data.yesterday;$('end').value=data.yesterday;if(data.job){$('mode').value=data.job.mode||'dates';$('start').value=data.job.start;$('end').value=data.job.end;$('metric').value='conversionScore';$('includeAds').checked=data.job.includeAds;}renderProducts();mode();showJob(data.job);}).withFailureHandler(error).wbComparisonInit();\n</script></body></html>\n";
-const WB_RECEIVER_EXPORTS = Object.freeze({doPost,wbInstallComparison,wbComparisonOnOpen,wbOpenComparison,wbComparisonInit,wbQueueComparison,wbCancelComparison,wbComparisonStatus});
+function wbHistoryStatus() {
+  const props=PropertiesService.getScriptProperties();
+  const summary=JSON.parse(props.getProperty('WB_HISTORY_STATUS') || 'null');
+  const job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB') || 'null');
+  return summary?Object.assign(summary,{importJob:job}):{dailyRows:0,days:0,articles:0,periodRows:0,importJob:job,unconfirmed:true};
+}
+
+function wbCreateHistoryImport_(props,start,end) {
+  if(!wbComparisonDate_(start)||!wbComparisonDate_(end)||start>end)throw new Error('Укажите корректные даты истории.');
+  const total=Math.round((Date.parse(end+'T12:00:00Z')-Date.parse(start+'T12:00:00Z'))/86400000)+1;
+  const today=Utilities.formatDate(new Date(),'Europe/Moscow','yyyy-MM-dd');
+  if(total>5000||end>=today)throw new Error('История загружается только за завершённые дни, до 5000 дней за задание.');
+  const catalog=wbReceiveCatalog_({schema:1},v=>v,props);
+  if(!catalog.ok||!catalog.ids.length)throw new Error('Не найдены артикулы для истории.');
+  const job={id:Utilities.getUuid(),kind:'history',status:'queued',ids:catalog.ids,start:start,end:end,cursor:start,
+    processedDays:0,totalDays:total,unavailableStreak:0,attempts:0,created:new Date().toISOString(),
+    message:'Дневная история поставлена в очередь с '+start+' по '+end+'.'};
+  props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));wbComparisonWake_(job.id);return job;
+}
+
+function wbEnsureHistoryImport_(props) {
+  if(props.getProperty('WB_HISTORY_IMPORT_INITIALIZED'))return;
+  if(!props.getProperty('WB_HISTORY_IMPORT_JOB')) {
+    const today=Utilities.formatDate(new Date(),'Europe/Moscow','yyyy-MM-dd');
+    const end=new Date(today+'T12:00:00Z');end.setUTCDate(end.getUTCDate()-1);
+    // Initial date explicitly requested by the user; never inferred as a WB limit.
+    wbCreateHistoryImport_(props,'2025-05-01',end.toISOString().slice(0,10));
+  }
+  props.setProperty('WB_HISTORY_IMPORT_INITIALIZED','1');
+}
+
+function wbStartHistoryImport(config) {
+  const lock=LockService.getScriptLock();lock.waitLock(10000);
+  try {
+    const props=PropertiesService.getScriptProperties(),old=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(old && ['queued','running'].indexOf(old.status)>=0)throw new Error('Импорт уже идёт. Сначала приостановите его.');
+    const job=wbCreateHistoryImport_(props,config.start,config.end);
+    props.setProperty('WB_HISTORY_IMPORT_INITIALIZED','1');return job;
+  } finally {lock.releaseLock();}
+}
+
+function wbPauseHistoryImport() {
+  const lock=LockService.getScriptLock();lock.waitLock(10000);
+  try {
+    const props=PropertiesService.getScriptProperties(),job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(job && ['queued','running'].indexOf(job.status)>=0){job.status='paused';job.message='Импорт приостановлен. Сохранённые дни остаются в базе.';props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));}
+    return job;
+  } finally {lock.releaseLock();}
+}
+
+function wbResumeHistoryImport() {
+  const lock=LockService.getScriptLock();lock.waitLock(10000);
+  try {
+    const props=PropertiesService.getScriptProperties(),job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(job && ['paused','error'].indexOf(job.status)>=0){job.status='queued';job.attempts=0;job.notBefore=0;job.message='Продолжение с '+job.cursor;props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));wbComparisonWake_(job.id);}
+    return job;
+  } finally {lock.releaseLock();}
+}
+
+function wbClaimHistoryImport_(props) {
+  const job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+  if(!job||['queued','running'].indexOf(job.status)<0||(job.notBefore&&job.notBefore>Date.now()))return null;
+  job.attempts=Number(job.attempts||0)+1;
+  if(job.attempts>3){job.status='error';job.message='Три прерывания импорта. Можно продолжить с '+job.cursor;props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));return null;}
+  job.status='running';job.message='Загружается дневная история с '+job.cursor;
+  props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));return job;
+}
+
+function wbHistoryImportAction_(request,reply,props) {
+  const lock=LockService.getScriptLock();if(!lock.tryLock(1000))return reply({ok:false,error:'Busy'});
+  try {
+    const job=JSON.parse(props.getProperty('WB_HISTORY_IMPORT_JOB')||'null');
+    if(request.schema!==1||!job||request.jobId!==job.id)return reply({ok:false,error:'History job mismatch'});
+    if(['queued','running'].indexOf(job.status)<0)return reply({ok:true,continue:false});
+    if(request.action==='historyError') {
+      job.status='error';job.message='Импорт остановлен на '+job.cursor+'. '+String(request.message||'Проверьте журнал сервера.').slice(0,180);
+    } else if(request.action==='historyDefer') {
+      job.status='queued';job.attempts=Math.max(0,Number(job.attempts||0)-1);job.message='Ожидается свободный профиль WB.';
+    } else {
+      const last=new Date(job.end+'T12:00:00Z');last.setUTCDate(last.getUTCDate()+1);const after=last.toISOString().slice(0,10);
+      if(!wbComparisonDate_(request.cursor)||request.cursor<job.cursor||request.cursor>after)return reply({ok:false,error:'Invalid history cursor'});
+      job.cursor=request.cursor;job.processedDays=Math.round((Date.parse(job.cursor+'T12:00:00Z')-Date.parse(job.start+'T12:00:00Z'))/86400000);
+      job.attempts=0;job.unavailableStreak=Number.isInteger(request.unavailableStreak)?Math.min(100,Math.max(0,request.unavailableStreak)):0;
+      job.notBefore=Date.now()+Math.min(86400,Math.max(0,Number(request.delaySeconds)||0))*1000;
+      job.lastRetryDelay=request.retryDelay?Math.min(86400,Math.max(0,Number(request.retryDelay)||0)):0;
+      job.status=job.cursor>job.end?'completed':request.yield?'queued':'running';
+      job.message=job.status==='completed'?'Обход истории завершён. Недоступные и неполные дни отмечены отдельно.':
+        'Обработано '+job.processedDays+' из '+job.totalDays+' дней. Следующая дата: '+job.cursor+(request.delaySeconds?' (пауза перед продолжением)':'');
+    }
+    props.setProperty('WB_HISTORY_IMPORT_JOB',JSON.stringify(job));
+    if(request.summary)wbReceiveHistoryStatus_({schema:1,summary:request.summary},v=>v,props);
+    if(job.status==='queued')wbComparisonWake_(job.id);
+    const compare=JSON.parse(props.getProperty('WB_COMPARISON_JOB')||'null');
+    return reply({ok:true,continue:['queued','running'].indexOf(job.status)>=0,comparisonWaiting:compare&&['queued','running'].indexOf(compare.status)>=0});
+  } finally {lock.releaseLock();}
+}
+
+const WB_COMPARISON_HTML = "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><style>\n[hidden]{display:none!important}body{font:13px Arial,sans-serif;background:#e5edf4;color:#21394e;margin:12px}h3{margin:14px 0 8px}input,select,button{box-sizing:border-box;font:inherit;border:1px solid #91a8bb;border-radius:6px;padding:8px;background:#d8e5ef;color:#17364e;width:100%;margin:4px 0}button{cursor:pointer;background:#285b7c;color:#fff;font-weight:bold}button:disabled{opacity:.5;cursor:wait}.muted{font-size:11px;line-height:1.5;color:#486074}.products{max-height:200px;overflow:auto;border:1px solid #91a8bb;border-radius:6px}.product{display:block;padding:7px;border-bottom:1px solid #bbccd9}.product:nth-child(even){background:#d5e2ed}input[type=checkbox]{width:auto;margin-right:6px}.row{display:flex;gap:6px}.status{padding:9px;background:#cfdeeb;white-space:pre-wrap;border-radius:6px;margin-top:10px}.card{padding:10px;margin:8px 0;border-radius:6px}.green{background:#c6e1cf}.yellow{background:#eee1b7}.red{background:#edc9c7}.none{background:#cbd6df}.error{background:#edc9c7}.secondary{background:#59768d}label{display:block;margin-top:7px}.value{font-size:18px;font-weight:bold;margin:6px 0}\n</style></head><body>\n<details id=\"historyDetails\"><summary>История данных</summary><div class=\"status\" id=\"history\">Ожидается создание архива на сервере.</div><button class=\"secondary\" id=\"historyRefresh\">Обновить сведения</button><button class=\"secondary\" id=\"historyPause\" hidden>Приостановить импорт</button><button class=\"secondary\" id=\"historyResume\" hidden>Продолжить импорт</button><button class=\"secondary\" id=\"historyStartImport\">Импорт всех артикулов за выбранные ниже даты</button><p class=\"muted\">Дни сохраняются отдельно. Многодневные отчёты — снимки периода, не дневная история. Копия находится на том же сервере.</p></details><p class=\"muted\">Цвета столбцов: песочный — ручной ввод (M, N); голубой — автоматические данные и расчёты; мятный — выбор товаров.</p><h3>Артикулы для сравнения</h3><input id=\"search\" placeholder=\"Поиск по артикулу, товару, типу\"><div class=\"row\"><button class=\"secondary\" id=\"selectVisible\">Выбрать найденные</button><button class=\"secondary\" id=\"clear\">Снять всё</button></div><div id=\"count\"></div><div class=\"products\" id=\"products\"></div>\n<h3>Период</h3><select id=\"mode\"><option value=\"dates\">Любые даты</option><option value=\"all\">С начала работы магазина</option></select>\n<label id=\"historyLabel\">Дата начала работы магазина<input type=\"date\" id=\"historyStart\"></label>\n<label id=\"startLabel\">С даты<input type=\"date\" id=\"start\"></label><label>По дату включительно<input type=\"date\" id=\"end\"></label>\n<p class=\"muted\">Можно выбрать прошлый год. Сегодня — неполный день. Доступность истории зависит от WB: при отказе период не подменяется. Дата начала магазина задаётся вами — автоматически она пока не определена.</p>\n<label><input type=\"checkbox\" id=\"historyOnly\">Сравнить по сохранённой дневной истории, без WB</label><p class=\"muted\">В этом режиме конверсии пересчитываются по дневным счётчикам. Карточки с пропущенными днями исключаются. Проценты WB за период могут рассчитываться иначе.</p><h3>ABC по конверсиям</h3><select id=\"metric\"><option value=\"conversionScore\">Четыре конверсии — равный вес</option></select>\n<input type=\"checkbox\" id=\"includeAds\" hidden>\n<p class=\"muted\">CTR, переход → корзина, корзина → заказ, заказ → выкуп: каждую конверсию делим на среднюю среди выбранных сопоставимых товаров и усредняем с равным весом. A — выше, B — средние, C — ниже. W — категория, X — отклонение индекса от среднего. Финансы в ABC не входят. Это относительная оценка, не статистический A/B-тест.</p>\n<label>Показать оценки<select id=\"gradeFilter\"><option value=\"all\">Все</option><option value=\"green\">A — выше</option><option value=\"yellow\">B — средние</option><option value=\"red\">C — ниже</option><option value=\"none\">Нет данных</option></select></label><button id=\"compare\" disabled>Сравнить</button><button id=\"cancel\" class=\"secondary\" hidden>Отменить ожидание</button><div class=\"status\" id=\"status\">Загрузка…</div><div id=\"results\"></div>\n<script>\nconst $=id=>document.getElementById(id);let products=[],selected=new Set(),currentJob=null,poller=null,lastHistoryJob=null,historyPoller=null;\nconst names={conversionScore:'Индекс конверсий (среднее 100)'};\nfunction text(el,value){el.textContent=value;return el;}\nfunction error(e){$('status').className='status error';$('status').textContent=e.message||String(e);$('compare').disabled=false;}\nfunction visible(){const q=$('search').value.trim().toLocaleLowerCase();return products.filter(p=>(p.id+' '+p.name+' '+p.type).toLocaleLowerCase().includes(q));}\nfunction renderProducts(){const root=$('products');root.textContent='';visible().forEach(p=>{const label=document.createElement('label');label.className='product';const box=document.createElement('input');box.type='checkbox';box.checked=selected.has(p.id);box.onchange=()=>{box.checked?selected.add(p.id):selected.delete(p.id);$('count').textContent='Выбрано: '+selected.size+' / 300';};label.append(box,document.createTextNode(p.id+' · '+p.name));root.appendChild(label);});$('count').textContent='Выбрано: '+selected.size+' / 300';}\nfunction mode(){const all=$('mode').value==='all';$('historyLabel').hidden=!all;$('startLabel').hidden=all;}\nfunction fmt(v,percent=false){return v===null||v===undefined?'нет данных':(percent?v*100:v).toLocaleString('ru-RU',{maximumFractionDigits:2})+(percent?'%':'');}\nfunction renderHistory(h){if(historyPoller){clearTimeout(historyPoller);historyPoller=null;}const j=h&&h.importJob,active=j&&['queued','running'].includes(j.status);$('historyPause').hidden=!active;$('historyResume').hidden=!(j&&['paused','error'].includes(j.status));$('historyStartImport').disabled=!!active;if(active)historyPoller=setTimeout(refreshHistory,10000);const el=$('history');if(!h){el.textContent='Архив ещё не подтвердил готовность.';return;}el.className='status'+(h.error?' error':'');el.textContent=(h.unconfirmed?'Архив ещё не подтвердил готовность.\\n':'')+(h.dailyRows?'Сохранено дней: '+h.days+'\\nПериод: '+h.firstDay+' — '+h.lastDay+'\\nДневных записей: '+h.dailyRows+' · Артикулов: '+h.articles:'Дневная история пока пуста.')+'\\nЗаписей за периоды: '+h.periodRows+(h.missingRows?'\\nТоваро-дней с неполными данными: '+h.missingRows:'')+(h.unavailableDays?'\\nWB не предоставил дней: '+h.unavailableDays:'')+(h.backupAt?'\\nКопия: '+new Date(h.backupAt).toLocaleString('ru-RU',{timeZone:'Europe/Moscow'})+' МСК':'\\nРезервной копии данных пока нет.')+(h.error?'\\n'+h.error:'')+(j?'\\n\\nИмпорт с '+j.start+' по '+j.end+'\\n'+j.message:'');}\nfunction refreshHistory(){google.script.run.withSuccessHandler(renderHistory).withFailureHandler(e=>{$('history').textContent=e.message||String(e);}).wbReceiverRpc('wbHistoryStatus');}\n$('historyRefresh').onclick=refreshHistory;\n$('historyPause').onclick=()=>google.script.run.withSuccessHandler(refreshHistory).withFailureHandler(error).wbReceiverRpc('wbPauseHistoryImport');\n$('historyResume').onclick=()=>google.script.run.withSuccessHandler(refreshHistory).withFailureHandler(error).wbReceiverRpc('wbResumeHistoryImport');\n$('historyStartImport').onclick=()=>google.script.run.withSuccessHandler(refreshHistory).withFailureHandler(error).wbReceiverRpc('wbStartHistoryImport',{start:$('mode').value==='all'?$('historyStart').value:$('start').value,end:$('end').value});\nfunction showJob(job){currentJob=job;const active=job&&['queued','running'].includes(job.status);$('compare').disabled=!!active;$('cancel').hidden=!active;$('status').className='status'+(job&&job.status==='error'?' error':'');$('status').textContent=job?job.message:'Выберите товары и период.';if(poller){clearTimeout(poller);poller=null;}if(active)poller=setTimeout(refresh,1000);$('results').textContent='';if(!job||job.status!=='completed')return;if(lastHistoryJob!==job.id){lastHistoryJob=job.id;refreshHistory();}\n text($('status'),job.start+' — '+job.end+(job.source==='history'?'\\nИсточник: дневная история, конверсии по счётчикам.':'\\nИсточник: запрос WB.')+'\\nПолучено '+job.results.length+' из '+job.ids.length+' товаров. '+(job.missing.length?'Нет полных сопоставимых данных WB: '+job.missing.join(', '):''));\n const legend=document.createElement('p');legend.className='muted';legend.textContent='ABC сравнивает только конверсии среди выбранных карточек. Для оценки нужны хотя бы две карточки с полной сопоставимой воронкой. Равные значения получают одинаковую категорию; серый — недостаточно данных.';$('results').appendChild(legend);\n job.results.filter(r=>$('gradeFilter').value==='all'||r.grade===$('gradeFilter').value).forEach(r=>{const card=document.createElement('div');card.className='card '+r.grade;const title=document.createElement('strong');title.textContent=(r.abc==='Нет данных'?'Нет данных':'ABC '+r.abc)+': '+r.id+' · '+r.name;const value=document.createElement('div');value.className='value';value.textContent=names[job.metric]+': '+fmt(r[job.metric],job.metric==='margin');const details=document.createElement('div');details.textContent='От среднего: '+(r.difference===null?'нет данных':(r.difference>0?'+':'')+fmt(r.difference,true))+'\\nCTR: '+fmt(r.ctr,true)+'\\nПереход → корзина: '+fmt(r.cartRate,true)+'\\nКорзина → заказ: '+fmt(r.orderRate,true)+'\\nЗаказ → выкуп: '+fmt(r.buyoutRate,true)+'\\nПоказы: '+fmt(r.impressions)+' · Заказы: '+fmt(r.orders)+' · Выкупы: '+fmt(r.buyouts);details.style.whiteSpace='pre-wrap';card.append(title,value,details);$('results').appendChild(card);});}\nfunction refresh(){google.script.run.withSuccessHandler(showJob).withFailureHandler(error).wbComparisonStatus();}\n$('gradeFilter').onchange=()=>{if(currentJob)showJob(currentJob);};\n$('search').oninput=renderProducts;$('mode').onchange=mode;$('selectVisible').onclick=()=>{visible().forEach(p=>{if(selected.size<300)selected.add(p.id);});renderProducts();};$('clear').onclick=()=>{selected.clear();renderProducts();};\n$('compare').onclick=()=>{if(selected.size<2||selected.size>300){error({message:'Выберите от 2 до 300 товаров.'});return;}$('compare').disabled=true;$('status').className='status';$('status').textContent='Отправляем команду на сравнение…';$('results').textContent='';google.script.run.withSuccessHandler(showJob).withFailureHandler(error).wbQueueComparison({ids:Array.from(selected),mode:$('mode').value,start:$('start').value,end:$('end').value,historyStart:$('historyStart').value,metric:$('metric').value,includeAds:$('includeAds').checked,historyOnly:$('historyOnly').checked});};\n$('cancel').onclick=()=>google.script.run.withSuccessHandler(showJob).withFailureHandler(error).wbCancelComparison();\ngoogle.script.run.withSuccessHandler(data=>{products=data.products;renderHistory(data.history);selected=new Set(products.filter(p=>p.selected).map(p=>p.id));$('historyStart').value=data.historyStart;$('start').value=data.yesterday;$('end').value=data.yesterday;if(data.job){$('mode').value=data.job.mode||'dates';$('start').value=data.job.start;$('end').value=data.job.end;$('metric').value='conversionScore';$('includeAds').checked=data.job.includeAds;$('historyOnly').checked=data.job.source==='history';}renderProducts();mode();showJob(data.job);}).withFailureHandler(error).wbComparisonInit();\n</script></body></html>\n";
+const WB_RECEIVER_EXPORTS = Object.freeze({doPost,wbInstallComparison,wbComparisonOnOpen,wbOpenComparison,wbComparisonInit,wbQueueComparison,wbCancelComparison,wbComparisonStatus,wbHistoryStatus,wbStartHistoryImport,wbPauseHistoryImport,wbResumeHistoryImport});

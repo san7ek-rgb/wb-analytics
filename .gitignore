@@ -9,3 +9,12 @@ __pycache__/
 .venv/
 node_modules/
 credentials/
+
+# Private on-server analytics archive and deployment state
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+server/history/
+.collector.lock

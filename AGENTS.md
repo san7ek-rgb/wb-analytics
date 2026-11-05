@@ -25,3 +25,8 @@
   do not claim such changes become automatic merely by changing the repository.
 - A successful source check is not proof of WB authorization, server installation
   or spreadsheet writes. Report observed status and missing verification clearly.
+- History lives in private SQLite under the app history/ directory. Never commit it.
+  Daily facts and multi-day snapshots must stay separate. Missing/partial responses
+  must not become zero sales. Cost observations are not historical effective costs.
+  Keep old workers isolated from history jobs with historyWorker=1 capability;
+  manual comparisons take priority. See HISTORY.md for recovery and limitations.
