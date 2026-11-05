@@ -7,6 +7,7 @@ function wbReceiverUpgrade_(releaseHash) {
   try {
     if(props.getProperty('WB_COMPARISON_STYLE_RELEASE')!==releaseHash) {
       wbColorComparisonColumns_();
+      wbFillSourceUnitProfit_();
       wbEnsureHistoryImport_(props);
       props.setProperty('WB_COMPARISON_STYLE_RELEASE',releaseHash);
     }
@@ -429,4 +430,28 @@ function wbHistoryImportAction_(request,reply,props) {
     const compare=JSON.parse(props.getProperty('WB_COMPARISON_JOB')||'null');
     return reply({ok:true,continue:['queued','running'].indexOf(job.status)>=0,comparisonWaiting:compare&&['queued','running'].indexOf(compare.status)>=0});
   } finally {lock.releaseLock();}
+}
+
+// Fill missing unit margins only; preserve the owner's entered margins/formulas.
+function wbFillSourceUnitProfit_() {
+  const forecast=wbComparisonSheet_(),book=forecast.getParent();
+  const sheet=book.getSheetByName('Рабочая табличка');
+  if(!sheet || sheet.getLastRow()<2)return;
+  const headers=sheet.getRange(1,1,1,sheet.getLastColumn()).getDisplayValues()[0].map(v=>v.trim());
+  const id=headers.indexOf('Артикул WB')+1,price=headers.indexOf('Цена, ₽')+1;
+  const profit=headers.findIndex(v=>/^Прибыль с выкупа/.test(v))+1;
+  if(!id||!price||!profit)return;
+  const helper=wbComparisonCostColumn_(forecast);
+  function letter(n){let value='';while(n){n--;value=String.fromCharCode(65+n%26)+value;n=Math.floor(n/26);}return value;}
+  const source="'"+forecast.getName().replace(/'/g,"''")+"'!";
+  const ids=source+'$'+letter(helper)+'$2:$'+letter(helper);
+  const costs=source+'$'+letter(helper+1)+'$2:$'+letter(helper+1);
+  const height=sheet.getLastRow()-1,range=sheet.getRange(2,profit,height,1);
+  const values=range.getValues(),formulas=range.getFormulas(),articles=sheet.getRange(2,id,height,1).getValues();
+  for(let i=0;i<height;i++) {
+    if(values[i][0]!==''||formulas[i][0]||!/^\d+$/.test(String(articles[i][0]).trim()))continue;
+    const row=i+2,priceRef='$'+letter(price)+row,idRef='$'+letter(id)+row;
+    sheet.getRange(row,profit).setFormula('=LET(unitCost,IFERROR(INDEX('+costs+',MATCH(TO_TEXT('+idRef+'),ARRAYFORMULA(TO_TEXT('+ids+')),0)),""),IF(AND(ISNUMBER('+priceRef+'),ISNUMBER(unitCost)),'+priceRef+'-unitCost,""))');
+  }
+  sheet.getRange(1,profit).setNote('Прибыль с одной единицы. Пустые ячейки рассчитываются как цена минус себестоимость по артикулу из справочника. Без комиссий, логистики, налогов и рекламы. Ранее введённые значения сохранены. Без цены или себестоимости расчёт пустой.');
 }
