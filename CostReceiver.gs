@@ -269,7 +269,17 @@ function wbPhotoApply_(request,reply,props) {
     const sheet=book.getSheets().find(s=>s.getSheetId()===1537466773);
     if(!sheet||!String(sheet.getRange('C5').getValue()).includes('1899054708'))return reply({ok:false,error:'Product header moved; no change'});
     const area=sheet.getRange('C4:D4'),marker='WB main photo 1899054708';
-    if(area.getNote()===marker){const cell=area.getCell(1,1),formula=cell.getFormula().replace(/,1\)$/,')');cell.setFormula(formula);SpreadsheetApp.flush();return reply({ok:!/^#/.test(cell.getDisplayValue()),alreadyApplied:true,formula:cell.getFormula(),display:cell.getDisplayValue()});}
+    if(area.getNote()===marker){
+      const cell=area.getCell(1,1),existing=sheet.getImages().find(i=>i.getAltTextDescription()===marker);
+      if(existing)return reply({ok:true,embedded:true,range:'C4:D4'});
+      const match=cell.getFormula().match(/https:\/\/[^"\s]+/);
+      if(!match)return reply({ok:false,error:'Photo URL missing'});
+      const image=UrlFetchApp.fetch(match[0].replace(/\.webp$/,'.jpg'),{muteHttpExceptions:true});
+      if(image.getResponseCode()!==200)return reply({ok:false,error:'JPEG download failed; formula retained'});
+      const placed=sheet.insertImage(image.getBlob(),3,4);placed.setAltTextDescription(marker).setWidth(180).setHeight(210);
+      cell.clearContent();sheet.setRowHeight(4,220);SpreadsheetApp.flush();
+      return reply({ok:true,embedded:true,range:'C4:D4'});
+    }
     if(area.getValues()[0].some(v=>v!=='')||area.getFormulas()[0].some(v=>v!==''))return reply({ok:false,error:'Photo cells occupied; no change'});
     const token=props.getProperty('WB_API_TOKEN');
     if(!token)return reply({ok:false,error:'WB content API token missing; no change'});
