@@ -110,7 +110,8 @@ function wbSetupForecastSheet_(book) {
       value('Маржинальность, %', ''), value('Заказы / 10 тыс. показов', ''),
       value('Выкупы / 10 тыс. показов', ''), value('Период данных WB', ''), value('Сравнить', false)]);
   });
-  const priorPeriod = out.getRange('W2').getValue();
+  const abcLayout=out.getRange('W1').getValue()==='ABC по конверсиям';
+  const priorPeriod = abcLayout?'':out.getRange('W2').getValue();
   out.getRange(1, 1, out.getMaxRows(), 22).clearContent();
   out.getRange(1, 1, output.length, 22).setValues(output);
   if (out.getFilter()) out.getFilter().remove();
@@ -135,19 +136,23 @@ function wbSetupForecastSheet_(book) {
   const periodRule = SpreadsheetApp.newDataValidation()
     .requireValueInList(['Вчера','Последние 7 дней','Последние 30 дней','Последние 90 дней','Последние 365 дней'], true)
     .setAllowInvalid(false).build();
+  if(!abcLayout) {
   out.getRange('W1').setValue('Период обновления');
   out.getRange('W2').setValue(priorPeriod || 'Вчера').setDataValidation(periodRule);
   out.getRange('W1').setBackground('#243b53').setFontColor('#ffffff').setFontWeight('bold');
   out.getRange('W2').setBackground('#dce8f2').setFontColor('#243b53');
   out.setColumnWidth(23, 190);
+  }
   const expected = ['WB ID из файла себестоимости','Себестоимость из файла, ₽','Последняя дата в файле'];
-  const costHeaders = out.getRange(1, 24, 1, 3).getValues()[0];
-  if (costHeaders.every(v => v === '')) out.getRange(1, 24, 1, 3).setValues([expected]);
-  else if (!expected.every((v, i) => costHeaders[i] === v)) throw new Error('X:Z заняты данными; справочник себестоимости не изменён.');
-  const costBand = out.getRange(1, 24, out.getMaxRows(), 3).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
+  const costColumn=wbCostColumn_(out)||(abcLayout?27:24);
+  if(out.getMaxColumns()<costColumn+2) out.insertColumnsAfter(out.getMaxColumns(),costColumn+2-out.getMaxColumns());
+  const costHeaders = out.getRange(1, costColumn, 1, 3).getValues()[0];
+  if (costHeaders.every(v => v === '')) out.getRange(1, costColumn, 1, 3).setValues([expected]);
+  else if (!expected.every((v, i) => costHeaders[i] === v)) throw new Error('Место справочника себестоимости занято; данные не изменены.');
+  const costBand = out.getRange(1, costColumn, out.getMaxRows(), 3).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
   costBand.setHeaderRowColor('#243b53'); costBand.setFirstRowColor('#e7eef5'); costBand.setSecondRowColor('#dce8f2');
-  out.getRange(1, 24, 1, 3).setFontColor('#ffffff').setFontWeight('bold').setWrap(true);
-  out.setColumnWidths(24, 2, 205); out.setColumnWidth(26, 150);
+  out.getRange(1, costColumn, 1, 3).setFontColor('#ffffff').setFontWeight('bold').setWrap(true);
+  out.setColumnWidths(costColumn, 2, 205); out.setColumnWidth(costColumn+2, 150);
   const n = output.length - 1;
   if (n > 0) {
     [[5],[8],[10],[12],[18]].forEach(x => out.getRange(2, x[0], n, 1).setNumberFormat('0.00%'));
@@ -192,7 +197,7 @@ function wbSetDays_(days) {
 
 function wbUpdateAll() {
   const sheet = SpreadsheetApp.openById(WB.bookId).getSheetByName('Прогноз по конверсиям');
-  const selected = sheet ? String(sheet.getRange('W2').getDisplayValue()).trim() : '';
+  const selected = sheet && sheet.getRange('W1').getValue()!=='ABC по конверсиям' ? String(sheet.getRange('W2').getDisplayValue()).trim() : '';
   const fromSheet = {
     'Вчера': 1, 'Последние 7 дней': 7, 'Последние 30 дней': 30,
     'Последние 90 дней': 90, 'Последние 365 дней': 365
@@ -222,7 +227,7 @@ function wbSetForecastPeriod_(days) {
   if (!sheet) return;
   const labels = {1: 'Вчера', 7: 'Последние 7 дней', 30: 'Последние 30 дней',
     90: 'Последние 90 дней', 365: 'Последние 365 дней'};
-  if (labels[days]) sheet.getRange('W2').setValue(labels[days]);
+  if (labels[days] && sheet.getRange('W1').getValue()!=='ABC по конверсиям') sheet.getRange('W2').setValue(labels[days]);
 }
 
 function wbRun_(days) {
@@ -674,6 +679,13 @@ function wbWrite_(sheet, records, period) {
   return matched;
 }
 
+function wbCostColumn_(sheet) {
+  const h=sheet.getRange(1,1,1,sheet.getLastColumn()).getDisplayValues()[0];
+  const names=['WB ID из файла себестоимости','Себестоимость из файла, ₽','Последняя дата в файле'];
+  const i=h.findIndex((v,index)=>names.every((name,j)=>h[index+j]===name));
+  return i<0?0:i+1;
+}
+
 function wbSyncForecast_(records, period) {
   if (PropertiesService.getScriptProperties().getProperty('WB_COMPARISON_JOB')) return;
   const book = SpreadsheetApp.openById(WB.bookId);
@@ -683,7 +695,8 @@ function wbSyncForecast_(records, period) {
   const col = new Map(headers.map((value, index) => [String(value).trim(), index + 1]));
   const rows = sheet.getRange(2,1,sheet.getLastRow()-1,22).getValues();
   const byId = new Map(records.map(record => [record.id, record]));
-  const costRows = sheet.getRange(2,24,Math.max(sheet.getLastRow()-1,1),3).getValues();
+  const costColumn=wbCostColumn_(sheet);
+  const costRows = costColumn?sheet.getRange(2,costColumn,Math.max(sheet.getLastRow()-1,1),3).getValues():[];
   const costsById = new Map();
   costRows.forEach(r => { const id=String(r[0]).trim(); if (/^\d+$/.test(id) && typeof r[1]==='number') costsById.set(id,r[1]); });
   const output = rows.map(row => row.slice());

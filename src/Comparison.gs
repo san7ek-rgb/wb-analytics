@@ -38,6 +38,7 @@ function wbComparisonOnOpen() {
 
 function wbColorComparisonColumns_() {
   const sheet=wbComparisonSheet_(),height=Math.max(2,sheet.getLastRow());
+  wbEnsureComparisonLayout_(sheet);
   sheet.getBandings().forEach(b=>{const r=b.getRange();if(r.getColumn()<=22 && r.getLastColumn()<=22)b.remove();});
   const backgrounds=[];
   for(let row=0;row<height;row++) {
@@ -56,7 +57,107 @@ function wbColorComparisonColumns_() {
   sheet.getRange('V1').setNote('Выбор товаров для сравнения. Панель «Сравнение WB» → «Открыть панель сравнения».');
   sheet.getRange(1,1,1,12).setNote('Автоматические данные. Меняйте товары и период через панель сравнения; значения воронки вручную не редактируйте.');
   sheet.getRange(1,15,1,7).setNote('Автоматические данные и расчёты. Формулы сохраняются.');
-  sheet.getRange('W1').setNote('Период обычной ежедневной загрузки. Для сравнения любых дат используйте правую панель «Сравнение WB».');
+  const abcBackgrounds=Array.from({length:height},(_,r)=>[r===0?'#294e70':r%2?'#e0eaf3':'#d2e0ec',r===0?'#294e70':r%2?'#e0eaf3':'#d2e0ec']);
+  sheet.getRange(1,23,height,2).setBackgrounds(abcBackgrounds);
+  sheet.getRange(1,23,1,2).setFontColor('#ffffff').setFontWeight('bold').setWrap(true);
+  sheet.getRange('W1').setNote('ABC только по четырём конверсиям с равным весом: CTR, переход → корзина, корзина → заказ, заказ → выкуп. Сравниваются выбранные товары за один период.');
+  sheet.getRange('X1').setNote('Относительное отклонение сводного индекса конверсий от среднего среди выбранных товаров. +20% означает индекс на 20% выше среднего, не разницу в процентных пунктах.');
+  const props=PropertiesService.getScriptProperties(),job=JSON.parse(props.getProperty('WB_COMPARISON_JOB')||'null');
+  if(job) wbWriteComparisonAbc_(sheet,job.ids,job.status==='completed'?wbComparisonFacts_(props):[],['queued','running'].indexOf(job.status)>=0);
+}
+
+function wbComparisonCostColumn_(sheet) {
+  const h=sheet.getRange(1,1,1,sheet.getLastColumn()).getDisplayValues()[0];
+  const expected=['WB ID из файла себестоимости','Себестоимость из файла, ₽','Последняя дата в файле'];
+  const matches=[];
+  h.forEach((v,i)=>{if(expected.every((name,j)=>h[i+j]===name))matches.push(i+1);});
+  if(matches.length!==1) throw new Error('Не удалось однозначно найти справочник себестоимости. Данные не перезаписаны.');
+  return matches[0];
+}
+
+function wbEnsureComparisonLayout_(sheet) {
+  let costColumn=wbComparisonCostColumn_(sheet);
+  const height=Math.max(1,sheet.getLastRow());
+  if(costColumn<=24 && costColumn+2>=23) {
+    let destination=27;
+    while(true) {
+      if(sheet.getMaxColumns()<destination+2) sheet.insertColumnsAfter(sheet.getMaxColumns(),destination+2-sheet.getMaxColumns());
+      const range=sheet.getRange(1,destination,height,3),values=range.getValues(),formulas=range.getFormulas();
+      if(values.every((row,r)=>row.every((v,c)=>v==='' && !formulas[r][c]))) break;
+      destination+=3;
+    }
+    sheet.getRange(1,costColumn,height,3).moveTo(sheet.getRange(1,destination,height,3));
+    sheet.getBandings().forEach(b=>{const r=b.getRange();if(r.getColumn()===costColumn && r.getLastColumn()===costColumn+2)b.remove();});
+    costColumn=destination;
+  }
+  if(sheet.getRange('W1').getValue()!=='ABC по конверсиям' || sheet.getRange('X1').getValue()!=='Отклонение от среднего, %') {
+    // The user explicitly replaced the old W/X controls; the cost block has
+    // already been moved intact, including formulas, before these are cleared.
+    sheet.getRange(2,23,Math.max(1,sheet.getMaxRows()-1),2).clearDataValidations();
+    sheet.getRange(2,23,Math.max(1,height-1),2).clearContent();
+    sheet.getRange(1,23,1,2).setValues([['ABC по конверсиям','Отклонение от среднего, %']]);
+  }
+  sheet.getRange(2,24,Math.max(1,sheet.getMaxRows()-1),1).setNumberFormat('+0.0%;-0.0%;0.0%');
+  sheet.setColumnWidth(23,170);sheet.setColumnWidth(24,230);
+  const filter=sheet.getFilter();
+  if(filter) {
+    const old=filter.getRange();
+    if(old.getRow()===1 && old.getColumn()===1 && old.getLastColumn()<24) {
+      const criteria=[];
+      for(let c=1;c<=old.getLastColumn();c++){const criterion=filter.getColumnFilterCriteria(c);if(criterion)criteria.push([c,criterion]);}
+      const end=Math.max(2,height,old.getLastRow());filter.remove();
+      const next=sheet.getRange(1,1,end,24).createFilter();
+      criteria.forEach(([c,criterion])=>next.setColumnFilterCriteria(c,criterion));
+    }
+  }
+  return costColumn;
+}
+
+function wbComparisonFacts_(props) {
+  const facts=[];
+  for(let i=0;i<Number(props.getProperty('WB_COMPARISON_ROWS_COUNT')||0);i++) facts.push.apply(facts,JSON.parse(props.getProperty('WB_COMPARISON_ROWS_'+i)||'[]'));
+  return facts;
+}
+
+function wbConversionRates_(fact) {
+  const ratio=(value,n,d)=>typeof value==='number' && Number.isFinite(value)?value:d>0?n/d:null;
+  return [ratio(fact.ctr,fact.clicks,fact.impressions),ratio(fact.cartRate,fact.carts,fact.clicks),
+    ratio(fact.orderRate,fact.orders,fact.carts),ratio(fact.buyoutRate,fact.buyouts,fact.orders)];
+}
+
+function wbConversionAbc_(facts) {
+  const rated=facts.map(f=>({id:f.id,rates:wbConversionRates_(f),eligible:f.impressions>0 && f.clicks>0 && f.carts>0 && f.orders>0}));
+  rated.forEach(r=>{r.eligible=r.eligible && r.rates.every(v=>typeof v==='number' && Number.isFinite(v) && v>=0 && v<=1);});
+  const eligible=rated.filter(r=>r.eligible),means=[0,0,0,0];
+  if(eligible.length<2) return new Map(rated.map(r=>[r.id,{category:'Нет данных',difference:null,score:null,rates:r.rates}]));
+  eligible.forEach(r=>r.rates.forEach((v,i)=>means[i]+=v/eligible.length));
+  eligible.forEach(r=>{r.score=r.rates.reduce((sum,v,i)=>sum+(means[i]>0?v/means[i]:1),0)/4;});
+  const scores=eligible.map(r=>r.score).sort((a,b)=>a-b);
+  const quantile=p=>{if(!scores.length)return null;const i=(scores.length-1)*p,lo=Math.floor(i),hi=Math.ceil(i);return scores[lo]+(scores[hi]-scores[lo])*(i-lo);};
+  const low=quantile(1/3),high=quantile(2/3),average=scores.length?scores.reduce((a,b)=>a+b,0)/scores.length:0;
+  return new Map(rated.map(r=>{
+    if(!r.eligible) return [r.id,{category:'Нет данных',difference:null,score:null,rates:r.rates}];
+    let category='B';
+    if(Math.abs(scores[scores.length-1]-scores[0])>1e-12) {
+      if(Math.abs(high-low)<1e-12) category=r.score>high+1e-12?'A':r.score<low-1e-12?'C':'B';
+      else category=r.score<=low?'C':r.score>=high?'A':'B';
+    }
+    return [r.id,{category:category,difference:average>0?r.score/average-1:0,score:r.score,rates:r.rates}];
+  }));
+}
+
+function wbWriteComparisonAbc_(sheet,ids,facts,loading) {
+  if(sheet.getRange('W1').getValue()!=='ABC по конверсиям') wbEnsureComparisonLayout_(sheet);
+  const n=Math.max(1,sheet.getLastRow()-1),rows=sheet.getRange(2,1,n,24).getValues(),formulas=sheet.getRange(2,23,n,2).getFormulas();
+  const selected=new Set(ids),abc=wbConversionAbc_(facts),out=[],backgrounds=[];
+  rows.forEach((r,i)=>{
+    const id=String(r[0]).trim(),rated=abc.get(id),chosen=selected.has(id);
+    const label=chosen?(loading?'Загрузка…':rated?rated.category:'Нет данных'):'';
+    const difference=chosen && !loading && rated?rated.difference:null;
+    out.push([formulas[i][0]||label,formulas[i][1]||(difference===null?'':difference)]);
+    const color=label==='A'?'#c6e1cf':label==='B'?'#eee1b7':label==='C'?'#edc9c7':i%2?'#d2e0ec':'#e0eaf3';backgrounds.push([color,color]);
+  });
+  sheet.getRange(2,23,n,2).setValues(out).setBackgrounds(backgrounds);
 }
 
 function wbOpenComparison() {
@@ -96,16 +197,17 @@ function wbQueueComparison(config) {
     if (!config || !Array.isArray(config.ids) || config.ids.length < 2 || config.ids.length > 300) throw new Error('Выберите от 2 до 300 артикулов.');
     const ids = Array.from(new Set(config.ids.map(String)));
     const sheet = wbComparisonSheet_();
+    wbEnsureComparisonLayout_(sheet);
     const rows = sheet.getRange(2,1,Math.max(1,sheet.getLastRow()-1),22).getValues();
     const known = new Set(rows.map(r => String(r[0]).trim()));
     if (ids.length !== config.ids.length || ids.some(id => !/^\d{1,16}$/.test(id) || !known.has(id))) throw new Error('В списке есть неизвестные или повторные артикулы.');
-    if (!config.includeAds && rows.some(r=>ids.indexOf(String(r[0]).trim())>=0 && typeof r[13]==='number' && r[13]!==0)) throw new Error('В N есть расходы на рекламу. Подтвердите, что они относятся к выбранному периоду, либо вручную установите 0.');
+    if (config.metric!=='conversionScore' && !config.includeAds && rows.some(r=>ids.indexOf(String(r[0]).trim())>=0 && typeof r[13]==='number' && r[13]!==0)) throw new Error('В N есть расходы на рекламу. Подтвердите, что они относятся к выбранному периоду, либо вручную установите 0.');
     const start = config.mode === 'all' ? config.historyStart : config.start;
     const end = config.end;
     if (!wbComparisonDate_(start) || !wbComparisonDate_(end) || start > end) throw new Error('Укажите корректные даты начала и конца. Для всей истории нужна дата начала работы магазина.');
     const today = Utilities.formatDate(new Date(),'Europe/Moscow','yyyy-MM-dd');
     if (end > today || start < '2000-01-01') throw new Error('Допустимы даты с 2000 года по сегодняшний день.');
-    const metrics = ['orders10000','buyouts10000','revenue10000','profitUnit','margin'];
+    const metrics = ['conversionScore','orders10000','buyouts10000','revenue10000','profitUnit','margin'];
     if (metrics.indexOf(config.metric) < 0) throw new Error('Неизвестный показатель сравнения.');
     const job = {id:Utilities.getUuid(),status:'queued',ids:ids,start:start,end:end,metric:config.metric,
       includeAds:config.includeAds === true,mode:config.mode==='all'?'all':'dates',created:new Date().toISOString(),message:'Команда принята. Сервер начинает загрузку после получения сигнала.'};
@@ -114,6 +216,7 @@ function wbQueueComparison(config) {
     const formulas = sheet.getRange(2,22,rows.length,1).getFormulas();
     const toggles=rows.map((r,i)=>[formulas[i][0] || (/^\d+$/.test(String(r[0]).trim())?ids.indexOf(String(r[0]).trim())>=0:r[21])]);
     sheet.getRange(2,22,rows.length,1).setValues(toggles);
+    wbWriteComparisonAbc_(sheet,ids,[],true);
     props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
     wbComparisonWake_(job.id);
     return job;
@@ -126,6 +229,7 @@ function wbCancelComparison() {
     const props=PropertiesService.getScriptProperties(), job=JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
     if (job && ['queued','running'].indexOf(job.status)>=0) {
       job.status='cancelled'; job.message='Сравнение отменено.';
+      wbWriteComparisonAbc_(wbComparisonSheet_(),job.ids,[],false);
       props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
       wbComparisonClearWake_();
     }
@@ -167,13 +271,14 @@ function wbComparisonTask_(request, reply, props) {
     }
     if (request.action === 'jobError') {
       if (request.jobId !== job.id) return reply({ok:false,error:'Job mismatch'});
+      wbWriteComparisonAbc_(wbComparisonSheet_(),job.ids,[],false);
       job.status='error'; job.message='Сервер не смог получить полный отчёт. '+String(request.message || 'Проверьте журнал сервера.').slice(0,250);
       props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
       wbComparisonClearWake_();
       return reply({ok:true});
     }
     job.attempts=Number(job.attempts || 0)+1;
-    if(job.attempts>3){job.status='error';job.message='Сервер трижды прервал сравнение. Проверьте доступность периода и журнал сервера.';props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));return reply({ok:true,job:null});}
+    if(job.attempts>3){wbWriteComparisonAbc_(wbComparisonSheet_(),job.ids,[],false);job.status='error';job.message='Сервер трижды прервал сравнение. Проверьте доступность периода и журнал сервера.';props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));return reply({ok:true,job:null});}
     job.status='running'; job.message='Загружается выбранный период. Большой или недоступный WB период может завершиться ошибкой.';
     props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
     wbComparisonClearWake_();
@@ -197,27 +302,26 @@ function wbSaveComparisonRows_(rows, props) {
 function wbComparisonStatus() {
   const props=PropertiesService.getScriptProperties(),job=JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
   if(!job || job.status!=='completed') return job;
-  const facts=[];
-  for(let i=0;i<Number(props.getProperty('WB_COMPARISON_ROWS_COUNT')||0);i++) facts.push.apply(facts,JSON.parse(props.getProperty('WB_COMPARISON_ROWS_'+i)||'[]'));
+  const facts=wbComparisonFacts_(props),abc=wbConversionAbc_(facts);
   const sheet=wbComparisonSheet_(),rows=sheet.getRange(2,1,Math.max(1,sheet.getLastRow()-1),22).getValues();
   const byId=new Map(rows.map(r=>[String(r[0]).trim(),r]));
   const results=facts.map(f=>{
     const r=byId.get(f.id)||[],cost=typeof r[12]==='number' && Number.isFinite(r[12]) && r[12]>=0?r[12]:null;
-    const ads=job.includeAds && typeof r[13]==='number'?r[13]:0;
+    const ads=typeof r[13]==='number'?r[13]:0;
     const revenue=typeof f.revenue==='number'?f.revenue:null;
     const profit=cost!==null && revenue!==null?revenue-f.buyouts*cost-ads:null;
-    return {id:f.id,name:String(r[1]||''),impressions:f.impressions,ctr:f.ctr,orders:f.orders,buyouts:f.buyouts,
+    const rating=abc.get(f.id),rates=rating.rates;
+    return {id:f.id,name:String(r[1]||''),impressions:f.impressions,ctr:rates[0],orders:f.orders,buyouts:f.buyouts,
+      cartRate:rates[1],orderRate:rates[2],buyoutRate:rates[3],abc:rating.category,difference:rating.difference,
+      conversionScore:rating.score===null?null:100*rating.score,
+      grade:rating.category==='A'?'green':rating.category==='B'?'yellow':rating.category==='C'?'red':'none',
       revenue:revenue,profit:profit,cost:cost,orders10000:f.impressions>0?10000*f.orders/f.impressions:null,
       buyouts10000:f.impressions>0?10000*f.buyouts/f.impressions:null,
       revenue10000:f.impressions>0 && revenue!==null?10000*revenue/f.impressions:null,
       profitUnit:f.buyouts>0 && profit!==null?profit/f.buyouts:null,
       margin:revenue>0 && profit!==null?profit/revenue:null};
   });
-  const valid=results.map(r=>r[job.metric]).filter(v=>typeof v==='number' && Number.isFinite(v)).sort((a,b)=>a-b);
-  const low=valid.length?valid[Math.floor((valid.length-1)/3)]:null;
-  const high=valid.length?valid[Math.ceil(2*(valid.length-1)/3)]:null;
-  results.forEach(r=>{const v=r[job.metric];r.grade=v===null?'none':low===high?'yellow':v<=low?'red':v>=high?'green':'yellow';});
-  results.sort((a,b)=>(b[job.metric]===null?-Infinity:b[job.metric])-(a[job.metric]===null?-Infinity:a[job.metric]));
-  job.results=results; job.missing=job.ids.filter(id=>!facts.some(r=>r.id===id));
+  results.sort((a,b)=>(b.conversionScore===null?-Infinity:b.conversionScore)-(a.conversionScore===null?-Infinity:a.conversionScore));
+  job.metric='conversionScore';job.results=results;job.missing=job.ids.filter(id=>!facts.some(r=>r.id===id));
   return job;
 }

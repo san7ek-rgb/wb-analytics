@@ -92,6 +92,9 @@ def flatten_rows(root):
             row = {"id": product_id, **counts,
                    "ctr": clicks / impressions if impressions else 0,
                    "revenue": report_number(item, ("buyoutSum",))}
+            for key, field in (("cartRate", "openToCart"), ("orderRate", "cartToOrder"), ("buyoutRate", "buyoutPercent")):
+                percent = report_number(item, (field,))
+                row[key] = percent / 100 if percent is not None and percent <= 100 else None
             if product_id in found and found[product_id] != row:
                 conflicts.add(product_id)
             else:
