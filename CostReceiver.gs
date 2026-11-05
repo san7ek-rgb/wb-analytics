@@ -269,7 +269,7 @@ function wbPhotoApply_(request,reply,props) {
     const sheet=book.getSheets().find(s=>s.getSheetId()===1537466773);
     if(!sheet||!String(sheet.getRange('C5').getValue()).includes('1899054708'))return reply({ok:false,error:'Product header moved; no change'});
     const area=sheet.getRange('C4:D4'),marker='WB main photo 1899054708';
-    if(area.getNote()===marker)return reply({ok:true,alreadyApplied:true,formula:area.getCell(1,1).getFormula()});
+    if(area.getNote()===marker){const cell=area.getCell(1,1),formula=cell.getFormula().replace(/,1\)$/,')');cell.setFormula(formula);SpreadsheetApp.flush();return reply({ok:!/^#/.test(cell.getDisplayValue()),alreadyApplied:true,formula:cell.getFormula(),display:cell.getDisplayValue()});}
     if(area.getValues()[0].some(v=>v!=='')||area.getFormulas()[0].some(v=>v!==''))return reply({ok:false,error:'Photo cells occupied; no change'});
     const token=props.getProperty('WB_API_TOKEN');
     if(!token)return reply({ok:false,error:'WB content API token missing; no change'});
@@ -283,7 +283,7 @@ function wbPhotoApply_(request,reply,props) {
     if(typeof url!=='string'||!/^https:\/\/[^/]+\.(?:wbasket|wbbasket|wbstatic)\.ru\//.test(url))return reply({ok:false,error:'Verified main photo unavailable; no change'});
     const check=UrlFetchApp.fetch(url,{muteHttpExceptions:true});
     if(check.getResponseCode()!==200||!/^image\//.test(String(check.getHeaders()['Content-Type']||check.getHeaders()['content-type']||'')))return reply({ok:false,error:'Photo download failed; no change'});
-    area.merge().setFormula('=IMAGE("'+url.replace(/"/g,'""')+'",1)').setNote(marker).setHorizontalAlignment('center').setVerticalAlignment('middle');
+    area.merge().setFormula('=IMAGE("'+url.replace(/"/g,'""')+'")').setNote(marker).setHorizontalAlignment('center').setVerticalAlignment('middle');
     sheet.setRowHeight(4,220);SpreadsheetApp.flush();
     return reply({ok:true,range:'C4:D4',header:sheet.getRange('C5').getDisplayValue(),formula:area.getCell(1,1).getFormula()});
   } finally {lock.releaseLock();}
