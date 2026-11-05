@@ -324,13 +324,11 @@ function wbPhotosApply_(request,reply,props) {
         const card=(JSON.parse(response.getContentText()).cards||[]).find(item=>String(item.nmID)===id);
         const url=card&&card.photos&&card.photos[0]&&card.photos[0].big;
         if(typeof url!=='string'||!/^https:\/\/[^/]+\.(?:wbasket|wbbasket|wbstatic)\.ru\//.test(url)){results.push({id:id,status:'no photo'});continue;}
-        const photo=UrlFetchApp.fetch(url.replace(/\.webp$/,'.jpg'),{muteHttpExceptions:true});
-        if(photo.getResponseCode()!==200){results.push({id:id,status:'download failed'});continue;}
-        const image=sheet.insertImage(photo.getBlob(),c+1,4);
-        const width=sheet.getColumnWidth(c+1)+(c+2<=sheet.getMaxColumns()?sheet.getColumnWidth(c+2):0);
-        image.setAltTextDescription(marker).setWidth(Math.min(180,width-8)).setHeight(210);
-        if(cell.getNote()===marker)cell.clearContent();
-        cell.setNote(marker);results.push({id:id,status:'inserted'});
+        const target=sheet.getRange(4,c+1,1,2);
+        if(target.getValues()[0].some(v=>v!=='') && cell.getNote()!==marker){results.push({id:id,status:'occupied'});continue;}
+        if(!target.isPartOfMerge())target.merge();
+        cell.setFormula('=IMAGE("'+url.replace(/"/g,'""')+'")').setNote(marker);
+        target.setHorizontalAlignment('center').setVerticalAlignment('middle');results.push({id:id,status:'inserted'});
       } catch(error){results.push({id:id,status:'error',error:String(error.message).slice(0,180)});}
     }
     sheet.setRowHeight(4,220);SpreadsheetApp.flush();
