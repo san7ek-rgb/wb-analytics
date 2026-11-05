@@ -34,7 +34,13 @@ function wbInstallComparison() {
   wbOpenComparison();
 }
 
-function wbComparisonOnOpen() {
+function wbComparisonOnOpen(e) {
+  if(e && e.range) {
+    if(e.range.getSheet().getSheetId()!==1537466773 || e.range.getRow()>5 || e.range.getLastRow()<5)return;
+    const result=wbPhotosApply_({schema:1,firstColumn:e.range.getColumn(),lastColumn:e.range.getLastColumn()},v=>v,PropertiesService.getScriptProperties());
+    if(!result.ok)console.log('WB photo update: '+JSON.stringify(result));
+    return;
+  }
   SpreadsheetApp.getUi().createMenu('Сравнение WB').addItem('Открыть панель сравнения', 'wbOpenComparison').addToUi();
 }
 

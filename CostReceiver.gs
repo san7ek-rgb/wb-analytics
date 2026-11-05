@@ -17,6 +17,7 @@ function doPost(e) {
   if (request.action === 'task' || request.action === 'jobError' || request.action === 'jobDefer') return wbComparisonTask_(request, reply, props);
   if (['historyProgress','historyError','historyDefer'].indexOf(request.action)>=0) return wbHistoryImportAction_(request,reply,props);
   if (request.action === 'historyStatus') return wbReceiveHistoryStatus_(request, reply, props);
+  if (request.action === 'photoAutoInstall') return wbPhotoAutoInstall_(request,reply,props);
   if (request.action === 'photosApply') return wbPhotosApply_(request, reply, props);
   if (request.action === 'photoApply') return wbPhotoApply_(request, reply, props);
   if (request.action === 'photoLayout') return wbPhotoLayout_(request, reply, props);
@@ -311,7 +312,14 @@ function wbPhotosApply_(request,reply,props) {
     const token=props.getProperty('WB_API_TOKEN'),results=[];
     if(!token)return reply({ok:false,error:'WB token missing'});
     for(let c=2;c<headings.length;c++) {
-      const match=String(headings[c]).match(/\b(\d{6,16})\b/);if(!match)continue;
+      if(request.firstColumn && (c+2<request.firstColumn || c+1>request.lastColumn))continue;
+      const match=String(headings[c]).match(/\b(\d{6,16})\b/);
+      const headerCell=sheet.getRange(4,c+1),oldNote=headerCell.getNote();
+      if(request.firstColumn && /^WB main photo \d+$/.test(oldNote)) {
+        headerCell.clearContent().clearNote();
+        sheet.getImages().filter(i=>i.getAnchorCell().getColumn()===c+1 && /^WB main photo \d+$/.test(i.getAltTextDescription())).forEach(i=>i.remove());
+      }
+      if(!match)continue;
       const id=match[1],cell=sheet.getRange(4,c+1),marker='WB main photo '+id;
       const existing=sheet.getImages().find(i=>i.getAltTextDescription()===marker && i.getAnchorCell().getColumn()===c+1);
       if(existing){results.push({id:id,status:'exists'});continue;}
@@ -334,6 +342,14 @@ function wbPhotosApply_(request,reply,props) {
     sheet.setRowHeight(4,220);SpreadsheetApp.flush();
     return reply({ok:results.every(r=>['exists','inserted'].includes(r.status)),results:results});
   } finally {lock.releaseLock();}
+}
+
+function wbPhotoAutoInstall_(request,reply,props) {
+  if(request.schema!==1)return reply({ok:false,error:'Invalid schema'});
+  const book=SpreadsheetApp.openById(props.getProperty('WB_SPREADSHEET_ID'));
+  const found=ScriptApp.getProjectTriggers().some(t=>t.getHandlerFunction()==='wbComparisonOnOpen' && t.getEventType()===ScriptApp.EventType.ON_EDIT && t.getTriggerSourceId()===book.getId());
+  if(!found)ScriptApp.newTrigger('wbComparisonOnOpen').forSpreadsheet(book).onEdit().create();
+  return reply({ok:true,installed:true});
 }
 
 // GENERATED COMPARISON UI — edit src/Comparison.gs and src/ComparisonSidebar.html
@@ -373,7 +389,13 @@ function wbInstallComparison() {
   wbOpenComparison();
 }
 
-function wbComparisonOnOpen() {
+function wbComparisonOnOpen(e) {
+  if(e && e.range) {
+    if(e.range.getSheet().getSheetId()!==1537466773 || e.range.getRow()>5 || e.range.getLastRow()<5)return;
+    const result=wbPhotosApply_({schema:1,firstColumn:e.range.getColumn(),lastColumn:e.range.getLastColumn()},v=>v,PropertiesService.getScriptProperties());
+    if(!result.ok)console.log('WB photo update: '+JSON.stringify(result));
+    return;
+  }
   SpreadsheetApp.getUi().createMenu('Сравнение WB').addItem('Открыть панель сравнения', 'wbOpenComparison').addToUi();
 }
 
