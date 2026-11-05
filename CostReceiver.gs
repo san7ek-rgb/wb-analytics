@@ -17,6 +17,7 @@ function doPost(e) {
   if (request.action === 'task' || request.action === 'jobError' || request.action === 'jobDefer') return wbComparisonTask_(request, reply, props);
   if (['historyProgress','historyError','historyDefer'].indexOf(request.action)>=0) return wbHistoryImportAction_(request,reply,props);
   if (request.action === 'historyStatus') return wbReceiveHistoryStatus_(request, reply, props);
+  if (request.action === 'photoLayout') return wbPhotoLayout_(request, reply, props);
   if (request.action === 'catalog') return wbReceiveCatalog_(request, reply, props);
   if (request.action === 'funnel') return wbReceiveFunnel_(request, reply, props);
   if (request.schema !== 1 || !Array.isArray(request.costs) || !request.costs.length || request.costs.length > 5000) {
@@ -248,6 +249,15 @@ function wbReceiveHistoryStatus_(request,reply,props) {
   if(previous && previous.updatedAt && summary.updatedAt && Date.parse(summary.updatedAt)<Date.parse(previous.updatedAt))return reply({ok:true,ignored:true});
   props.setProperty('WB_HISTORY_STATUS',JSON.stringify(summary));
   return reply({ok:true});
+}
+
+function wbPhotoLayout_(request,reply,props) {
+  if(request.schema!==1)return reply({ok:false,error:'Invalid schema'});
+  const book=SpreadsheetApp.openById(props.getProperty('WB_SPREADSHEET_ID'));
+  const sheet=book.getSheets().find(s=>s.getSheetId()===1537466773);
+  if(!sheet)return reply({ok:false,error:'Target sheet missing'});
+  const range=sheet.getRange(1,1,Math.min(sheet.getLastRow(),30),Math.min(sheet.getLastColumn(),100));
+  return reply({ok:true,name:sheet.getName(),values:range.getDisplayValues(),formulas:range.getFormulas(),merges:range.getMergedRanges().map(r=>r.getA1Notation())});
 }
 
 // GENERATED COMPARISON UI — edit src/Comparison.gs and src/ComparisonSidebar.html
