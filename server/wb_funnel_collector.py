@@ -257,12 +257,7 @@ def report_job_error(job, message):
             print("Could not update comparison error status; inspect server journal.", flush=True)
 
 
-def main():
-    job = None
-    if "--poll" in sys.argv:
-        job = receiver_action("task").get("job")
-        if not job:
-            return
+def main(job=None):
     profile = os.environ.get("WB_FIREFOX_PROFILE", "/home/reportdeploy/wb-automation/profile")
     if not os.path.isdir(profile):
         report_job_error(job, "Dedicated Firefox profile directory is missing.")
@@ -310,17 +305,33 @@ def main():
         raise SystemExit(1)
 
 
-if __name__ == "__main__":
-    if "--self-check" in sys.argv:
-        # No credentials, Firefox launch, network or spreadsheet writes.
-        print("WB collector imports OK", flush=True)
-        raise SystemExit(0)
-    # Daily collection and minute polling share one persistent Firefox profile.
+def run_service():
     lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".collector.lock")
     with open(lock_path, "a") as collector_lock:
+        job = None
+        if "--poll" in sys.argv:
+            # Do not claim a comparison while the daily collector is busy.
+            try:
+                fcntl.flock(collector_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            fcntl.flock(collector_lock, fcntl.LOCK_UN)
+            # No profile lock, Firefox, or WB request while waiting for a command.
+            job = receiver_action("task", waitSeconds=20).get("job")
+            if not job:
+                return
         try:
             fcntl.flock(collector_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if job:
+                receiver_action("jobDefer", jobId=job["id"])
             print("Another collection owns the profile; next timer will retry.", flush=True)
-            raise SystemExit(0)
-        main()
+            return
+        main(job)
+
+
+if __name__ == "__main__":
+    if "--self-check" in sys.argv:
+        print("WB collector imports OK", flush=True)
+        raise SystemExit(0)
+    run_service()

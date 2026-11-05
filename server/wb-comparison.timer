@@ -1,10 +1,10 @@
 [Unit]
-Description=Check for comparison requests from Google Sheets
+Description=Resume the waiting comparison worker
 
 [Timer]
-OnBootSec=1min
-OnUnitInactiveSec=1min
-AccuracySec=5s
+OnBootSec=3s
+OnUnitInactiveSec=3s
+AccuracySec=1s
 Unit=wb-comparison.service
 
 [Install]

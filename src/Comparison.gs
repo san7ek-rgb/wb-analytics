@@ -108,12 +108,14 @@ function wbQueueComparison(config) {
     const metrics = ['orders10000','buyouts10000','revenue10000','profitUnit','margin'];
     if (metrics.indexOf(config.metric) < 0) throw new Error('Неизвестный показатель сравнения.');
     const job = {id:Utilities.getUuid(),status:'queued',ids:ids,start:start,end:end,metric:config.metric,
-      includeAds:config.includeAds === true,mode:config.mode==='all'?'all':'dates',created:new Date().toISOString(),message:'Ожидает запуска на сервере (обычно до минуты).'};
+      includeAds:config.includeAds === true,mode:config.mode==='all'?'all':'dates',created:new Date().toISOString(),message:'Команда принята. Сервер начинает загрузку после получения сигнала.'};
     if (wbComparisonDate_(config.historyStart)) props.setProperty('WB_HISTORY_START',config.historyStart);
     // Only the existing comparison checkboxes are synchronized; formulas are preserved.
     const formulas = sheet.getRange(2,22,rows.length,1).getFormulas();
-    rows.forEach((r,i) => { if (!formulas[i][0] && /^\d+$/.test(String(r[0]).trim())) sheet.getRange(i+2,22).setValue(ids.indexOf(String(r[0]).trim()) >= 0); });
+    const toggles=rows.map((r,i)=>[formulas[i][0] || (/^\d+$/.test(String(r[0]).trim())?ids.indexOf(String(r[0]).trim())>=0:r[21])]);
+    sheet.getRange(2,22,rows.length,1).setValues(toggles);
     props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
+    wbComparisonWake_(job.id);
     return job;
   } finally { lock.releaseLock(); }
 }
@@ -125,27 +127,56 @@ function wbCancelComparison() {
     if (job && ['queued','running'].indexOf(job.status)>=0) {
       job.status='cancelled'; job.message='Сравнение отменено.';
       props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
+      wbComparisonClearWake_();
     }
     return job;
   } finally {lock.releaseLock();}
 }
 
+function wbComparisonWake_(id) {
+  try {CacheService.getScriptCache().put('wb-comparison-pending',id,21600);} catch (_) { /* Property is still the authoritative queue. */ }
+}
+function wbComparisonClearWake_() {
+  try {CacheService.getScriptCache().remove('wb-comparison-pending');} catch (_) {}
+}
+
 function wbComparisonTask_(request, reply, props) {
   if (request.schema !== 1) return reply({ok:false,error:'Invalid schema'});
+  // Hold the control connection, never the script lock, while idle. This avoids
+  // frequent properties reads and lets a new command wake the worker promptly.
+  if (request.action==='task' && Number.isInteger(request.waitSeconds) && request.waitSeconds>0) {
+    const peek=JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
+    if (!peek || ['queued','running'].indexOf(peek.status)<0) {
+      const deadline=Date.now()+Math.min(request.waitSeconds,20)*1000;
+      while(Date.now()<deadline) {
+        try {if(CacheService.getScriptCache().get('wb-comparison-pending')) break;} catch (_) {break;}
+        Utilities.sleep(500);
+      }
+    }
+  }
   const lock = LockService.getScriptLock(); if (!lock.tryLock(1000)) return reply({ok:false,error:'Busy'});
   try {
     const job = JSON.parse(props.getProperty('WB_COMPARISON_JOB') || 'null');
-    if (!job || ['queued','running'].indexOf(job.status)<0) return reply({ok:true,job:null});
+    if (!job || ['queued','running'].indexOf(job.status)<0) {wbComparisonClearWake_();return reply({ok:true,job:null});}
+    if (request.action==='jobDefer') {
+      if(request.jobId!==job.id) return reply({ok:false,error:'Job mismatch'});
+      job.status='queued';job.attempts=Math.max(0,Number(job.attempts||0)-1);
+      job.message='Команда принята. Ожидает завершения текущей загрузки WB.';
+      props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));wbComparisonWake_(job.id);
+      return reply({ok:true});
+    }
     if (request.action === 'jobError') {
       if (request.jobId !== job.id) return reply({ok:false,error:'Job mismatch'});
       job.status='error'; job.message='Сервер не смог получить полный отчёт. '+String(request.message || 'Проверьте журнал сервера.').slice(0,250);
       props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
+      wbComparisonClearWake_();
       return reply({ok:true});
     }
     job.attempts=Number(job.attempts || 0)+1;
     if(job.attempts>3){job.status='error';job.message='Сервер трижды прервал сравнение. Проверьте доступность периода и журнал сервера.';props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));return reply({ok:true,job:null});}
     job.status='running'; job.message='Загружается выбранный период. Большой или недоступный WB период может завершиться ошибкой.';
     props.setProperty('WB_COMPARISON_JOB',JSON.stringify(job));
+    wbComparisonClearWake_();
     return reply({ok:true,job:job});
   } finally {lock.releaseLock();}
 }
